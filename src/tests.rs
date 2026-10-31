@@ -989,3 +989,94 @@ fn gpu_optimizer_perf() {
     println!("adamw 847k params:   cpu {cpu_ms:.2} ms   gpu {gpu_ms:.2} ms  (ratio {:.1}×)", cpu_ms / gpu_ms);
     println!("sqnorm clip   847k:  gpu (incl staging) {gnorm_ms:.2} ms");
 }
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_ce_parity"]
+fn gpu_ce_parity() {
+    use crate::gpu::GpuOps;
+    let ops = GpuOps::new().expect("GpuOps device open");
+    let mut rng = Rng::new(0xCE_CAFE);
+    fn r2(rng: &mut Rng, n: usize) -> Vec<f32> {
+        (0..n).map(|_| rng.normal(0.0, 1.0)).collect()
+    }
+    let tol = 2e-3;
+
+    // Shapes: default (1024×155), ragged (17×33, 5×7), single row, and
+    // large-magnitude logits (±30) exercising the max-shift stability path.
+    for &(rows, vocab) in
+        [(1024usize, 155usize), (17, 33), (5, 7), (1, 128), (3, 1024)].iter()
+    {
+        let logits = r2(&mut rng, rows * vocab);
+        let targets: Vec<usize> =
+            (0..rows).map(|_| rng.rand_index(vocab)).collect();
+
+        let (cl, cd, cp) = crate::ops::cross_entropy(&logits, &targets, rows, vocab);
+        let (gl, gd, gp) = ops.cross_entropy(&logits, &targets, rows, vocab);
+
+        let e = rel_err_max(&cp, &gp);
+        println!("ce probs {rows}×{vocab}: max rel err {e:.3e}");
+        assert!(e < tol, "ce probs {rows}×{vocab}");
+        let e = rel_err_max(&cd, &gd);
+        println!("  ce dlogits {rows}×{vocab}: max rel err {e:.3e}");
+        assert!(e < tol, "ce dlogits {rows}×{vocab}");
+        let dl = ((cl - gl) as f64 / cl as f64).abs();
+        println!("  ce loss {rows}×{vocab}: cpu {cl:.6} gpu {gl:.6} rel {dl:.3e}");
+        assert!(dl < tol, "ce loss {rows}×{vocab}");
+    }
+
+    // Large-magnitude logits: max-shift must keep probs finite/normalized.
+    let (rows, vocab) = (64usize, 100usize);
+    let logits: Vec<f32> = (0..rows * vocab)
+        .map(|i| match i % 3 {
+            0 => rng.normal(0.0, 30.0),
+            1 => -rng.normal(0.0, 30.0).abs(),
+            _ => 0.5 * rng.normal(0.0, 1.0),
+        })
+        .collect();
+    let targets: Vec<usize> = (0..rows).map(|r| (r * 7) % vocab).collect();
+    let (cl, cd, cp) = crate::ops::cross_entropy(&logits, &targets, rows, vocab);
+    let (gl, gd, gp) = ops.cross_entropy(&logits, &targets, rows, vocab);
+    let e = rel_err_max(&cp, &gp);
+    println!("ce probs biglogits: max rel err {e:.3e}");
+    assert!(e < tol, "ce probs biglogits");
+    let e = rel_err_max(&cd, &gd);
+    println!("  ce dlogits biglogits: max rel err {e:.3e}");
+    assert!(e < tol, "ce dlogits biglogits");
+    let dl = ((cl - gl) as f64 / cl as f64).abs();
+    println!("  ce loss biglogits: cpu {cl:.6} gpu {gl:.6} rel {dl:.3e}");
+    assert!(dl < tol, "ce loss biglogits");
+    println!("gpu_ce_parity: all shapes within tol");
+}
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_ce_perf"]
+fn gpu_ce_perf() {
+    use crate::gpu::GpuOps;
+    use std::hint::black_box;
+    use std::time::Instant;
+    let ops = GpuOps::new().expect("GpuOps device open");
+    let mut rng = Rng::new(0xBAD_5EED);
+
+    // Default-config loss head: rows=1024 over vocab=155.
+    let (rows, vocab) = (1024usize, 155usize);
+    let logits: Vec<f32> = (0..rows * vocab).map(|_| rng.normal(0.0, 1.0)).collect();
+    let targets: Vec<usize> =
+        (0..rows).map(|_| rng.rand_index(vocab)).collect();
+    let (iters, warm) = (10usize, 3usize);
+
+    for _ in 0..warm {
+        black_box(crate::ops::cross_entropy(&logits, &targets, rows, vocab));
+        black_box(ops.cross_entropy(&logits, &targets, rows, vocab));
+    }
+    let t = Instant::now();
+    for _ in 0..iters {
+        black_box(crate::ops::cross_entropy(&logits, &targets, rows, vocab));
+    }
+    let cpu_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    let t = Instant::now();
+    for _ in 0..iters {
+        black_box(ops.cross_entropy(&logits, &targets, rows, vocab));
+    }
+    let gpu_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    println!("ce {rows}x{vocab}: cpu {cpu_ms:.3} ms  gpu {gpu_ms:.3} ms  (ratio {:.1}x)", cpu_ms / gpu_ms);
+}

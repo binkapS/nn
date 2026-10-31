@@ -241,3 +241,33 @@ Notes:
   (wgpu validation error caught by the parity test).
 * The `powf` bias corrections stay host-side (no powf in WGSL core);
   `bc1/bc2` arrive in the uniform block.
+
+### Stage 2.4 — softmax cross-entropy GPU kernels
+
+Parity (vs CPU `ops::cross_entropy`, max rel err within the 2e-3 gate) —
+shapes 1024×155 (default), 17×33, 5×7, 1×128, 3×1024, and ±30-magnitude
+logits exercising max-shift stability + the underflow clamp:
+
+| check    | max rel err |
+|----------|-------------|
+| probs    | 1.2e-7      |
+| dlogits  | 1.9e-9      |
+| mean loss| 0 (identical f64 fold; incl. EPS-clamped underflow rows) |
+
+Kernel design:
+* `ce_fwd`: one row per workgroup, four passes over the row (max → Σexp →
+  probs → per-row loss written by lane 0 into a (rows,) buffer); host folds
+  the mean in f64 mirroring the CPU exactly.
+* `ce_bwd`: elementwise `(p − onehot)/rows` with u32 row/col decode from
+  the flat index (div/mod).
+* Targets upload as a u32 storage buffer (`upload_u32_storage`); the host
+  API takes `&[usize]` like the CPU and converts.
+* Lesson #8: the CPU clamps the target probability at `f32::EPSILON`
+  before `ln`; the kernel must too — a ±30-logit sweep sends p_target to
+  exact 0, and `−log(0) = +inf` made the mean loss inf while all 128k
+  probs still agreed to 1e-7. Loss reduction paths are as numerically
+  load-bearing as the forward math.
+
+Un-fused perf at 1024×155: CPU 3.4 ms vs GPU 18.3 ms — two ~1.3 MB
+readbacks (probs + dlogits) + one (rows,) loss dominate; residency (2.7)
+turns this into a striped on-device pass.

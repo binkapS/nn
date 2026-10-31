@@ -819,6 +819,117 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Softmax cross-entropy forward, one row per workgroup: computes the
+/// numerically stable row softmax, writes `probs`, and emits the per-row
+/// loss `-ln(max p[target], EPS)` into a per-row buffer (the host folds
+/// the mean in f64, mirroring the CPU accumulation).
+const CE_FWD_WGSL: &str = r#"
+struct CeDims {
+    rows: u32,
+    vocab: u32,
+    pad0: u32,
+    pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> logits_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> tgt_buf: array<u32>;
+@group(0) @binding(2) var<storage, read_write> probs_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> loss_buf: array<f32>;
+@group(0) @binding(4) var<uniform> dims: CeDims;
+
+const WG: u32 = 256u;
+var<workgroup> red0: array<f32, 256>;
+var<workgroup> red1: array<f32, 256>;
+
+const LN_EPS_P: f32 = 1.1920929e-07; // f32::EPSILON, matches CPU clamp
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    let v = dims.vocab;
+    let lane = lid.x;
+    let base = row * v;
+    let tgt = tgt_buf[row];
+
+    // pass 1: row max
+    var mx = -3.4e38; // f32 approx of -inf for reduction purposes
+    for (var cc = lane; cc < v; cc = cc + WG) {
+        mx = max(mx, logits_buf[base + cc]);
+    }
+    red0[lane] = mx;
+    workgroupBarrier();
+    for (var stride = WG / 2u; stride > 0u; stride = stride / 2u) {
+        if (lane < stride) {
+            red0[lane] = max(red0[lane], red0[lane + stride]);
+        }
+        workgroupBarrier();
+    }
+    let rm = red0[0];
+    workgroupBarrier();
+
+    // pass 2: Σ exp(x − max)
+    var z = 0.0;
+    for (var cc = lane; cc < v; cc = cc + WG) {
+        z = z + exp(logits_buf[base + cc] - rm);
+    }
+    red0[lane] = z;
+    workgroupBarrier();
+    for (var stride = WG / 2u; stride > 0u; stride = stride / 2u) {
+        if (lane < stride) {
+            red0[lane] = red0[lane] + red0[lane + stride];
+        }
+        workgroupBarrier();
+    }
+    let rz = red0[0];
+    workgroupBarrier();
+
+    // pass 3: probs
+    for (var cc = lane; cc < v; cc = cc + WG) {
+        probs_buf[base + cc] = exp(logits_buf[base + cc] - rm) / rz;
+    }
+    workgroupBarrier();
+
+    // pass 4: per-row loss from the target logit (one lane); clamp p at
+    // f32::EPSILON exactly like the CPU (`p.max(f32::EPSILON).ln()`).
+    if (lane == 0u) {
+        let pv = probs_buf[base + tgt];
+        let pt = select(1.0, pv, tgt < v);
+        loss_buf[row] = -log(max(pt, LN_EPS_P));
+    }
+}
+"#;
+
+/// Softmax-CE backward, elementwise over (rows × vocab):
+/// `dlogits = (p − onehot(target)) / rows`.
+const CE_BWD_WGSL: &str = r#"
+struct CeDims {
+    rows: u32,
+    vocab: u32,
+    pad0: u32,
+    pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> p_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> tgt_buf: array<u32>;
+@group(0) @binding(2) var<storage, read_write> d_buf: array<f32>;
+@group(0) @binding(3) var<uniform> dims: CeDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let n = dims.rows * dims.vocab;
+    if (i >= n) {
+        return;
+    }
+    let row = i / dims.vocab;
+    let col = i % dims.vocab;
+    let is_tgt = col == tgt_buf[row];
+    let d = p_buf[i] - select(0.0, 1.0, is_tgt);
+    d_buf[i] = d / f32(dims.rows);
+}
+"#;
+
 /// Elementwise + reduction GPU ops (LayerNorm fwd/bwd, GeLU fwd/bwd).
 /// Mirrors the CPU contracts in `ops.rs` element for element.
 pub struct GpuOps {
@@ -832,6 +943,8 @@ pub struct GpuOps {
     adamw: wgpu::ComputePipeline,
     sqnorm: wgpu::ComputePipeline,
     grad_scale: wgpu::ComputePipeline,
+    ce_fwd: wgpu::ComputePipeline,
+    ce_bwd: wgpu::ComputePipeline,
 }
 
 impl GpuOps {
@@ -845,6 +958,8 @@ impl GpuOps {
         let adamw = pipeline(&device, "adamw", ADAMW_WGSL);
         let sqnorm = pipeline(&device, "sqnorm", SQNORM_WGSL);
         let grad_scale = pipeline(&device, "grad-scale", GRAD_SCALE_WGSL);
+        let ce_fwd = pipeline(&device, "ce-fwd", CE_FWD_WGSL);
+        let ce_bwd = pipeline(&device, "ce-bwd", CE_BWD_WGSL);
         Ok(Self {
             device,
             queue,
@@ -856,6 +971,8 @@ impl GpuOps {
             adamw,
             sqnorm,
             grad_scale,
+            ce_fwd,
+            ce_bwd,
         })
     }
 
@@ -1101,6 +1218,63 @@ impl GpuOps {
         let g_out = readback_f32(&self.device, &self.queue, &g_buf, n);
         grads.copy_from_slice(&g_out);
     }
+
+    /// Softmax cross-entropy, `ops::cross_entropy` semantics: returns
+    /// `(mean_loss, dlogits, probs)` where `dlogits = (p − onehot)/rows`
+    /// and the mean is folded host-side in f64 exactly like the CPU.
+    pub fn cross_entropy(
+        &self,
+        logits: &[f32],
+        targets: &[usize],
+        rows: usize,
+        vocab: usize,
+    ) -> (f32, Vec<f32>, Vec<f32>) {
+        assert_eq!(logits.len(), rows * vocab, "logits shape");
+        assert_eq!(targets.len(), rows, "targets shape");
+        if rows == 0 {
+            return (0.0, Vec::new(), Vec::new());
+        }
+        for &t in targets {
+            assert!(t < vocab, "target out of vocab");
+        }
+        let tgt_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+        let dims = [rows as u32, vocab as u32, 0u32, 0u32];
+        let x_buf = upload_f32(&self.device, &self.queue, logits);
+        let tgt_buf = upload_u32_storage(&self.device, &self.queue, &tgt_u32);
+        let p_buf = storage_out(&self.device, rows * vocab);
+        let loss_buf = storage_out(&self.device, rows);
+        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.ce_fwd,
+            [rows as u32, 1],
+            &[
+                bind(0, &x_buf),
+                bind(1, &tgt_buf),
+                bind(2, &p_buf),
+                bind(3, &loss_buf),
+                bind(4, &dims_buf),
+            ],
+        );
+
+        // dlogits = (p − onehot)/rows via the elementwise bwd kernel.
+        let d_buf = storage_out(&self.device, rows * vocab);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.ce_bwd,
+            [ceil_div(rows * vocab, 256) as u32, 1],
+            &[bind(0, &p_buf), bind(1, &tgt_buf), bind(2, &d_buf), bind(3, &dims_buf)],
+        );
+
+        let probs = readback_f32(&self.device, &self.queue, &p_buf, rows * vocab);
+        let per_row = readback_f32(&self.device, &self.queue, &loss_buf, rows);
+        let loss =
+            (per_row.iter().map(|&l| l as f64).sum::<f64>() / rows as f64) as f32;
+        let dlogits = readback_f32(&self.device, &self.queue, &d_buf, rows * vocab);
+        (loss, dlogits, probs)
+    }
 }
 
 /// Read-only-storage-size output buffer (kernel writes, host copies out).
@@ -1205,6 +1379,19 @@ fn upload_uniform_u32(device: &wgpu::Device, queue: &wgpu::Queue, data: &[u32]) 
         label: Some("gemm-dims"),
         size: bytes.len() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buf, 0, &bytes);
+    buf
+}
+
+/// Uploads u32 data into a read-only storage buffer (token targets, ids).
+fn upload_u32_storage(device: &wgpu::Device, queue: &wgpu::Queue, data: &[u32]) -> wgpu::Buffer {
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gpu-u32-in"),
+        size: bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     queue.write_buffer(&buf, 0, &bytes);

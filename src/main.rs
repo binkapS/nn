@@ -24,6 +24,10 @@ use transformer::{Config, Gpt};
 struct Args {
     data: Option<String>,
     hf: Option<String>,
+    /// True only when `--hf` was given on the command line (vs. the built-in
+    /// default). Lets `--data` silently override the default dataset while
+    /// still erroring on an explicit `--hf X --data Y` conflict.
+    hf_explicit: bool,
     steps: usize,
     layers: usize,
     heads: usize,
@@ -44,12 +48,14 @@ struct Args {
 fn default_args() -> Args {
     Args {
         data: None,
-        hf: None,
-        steps: 2000,
-        layers: 3,
-        heads: 3,
-        embd: 96,
-        block: 64,
+        // Default dataset: allenai/c4 (streaming sample, see data.rs).
+        hf: Some(data::DEFAULT_HF_ALIAS.to_string()),
+        hf_explicit: false,
+        steps: 5000,
+        layers: 4,
+        heads: 4,
+        embd: 128,
+        block: 128,
         batch: 8,
         lr: 1.5e-3,
         wd: 0.1,
@@ -91,8 +97,17 @@ fn parse_args() -> Args {
                 print!("{usage}");
                 std::process::exit(0);
             }
-            "--data" => a.data = Some(next!().to_string()),
-            "--hf" => a.hf = Some(next!().to_string()),
+            "--data" => {
+                a.data = Some(next!().to_string());
+                // The default --hf is silent; an explicit one conflicts.
+                if !a.hf_explicit {
+                    a.hf = None;
+                }
+            }
+            "--hf" => {
+                a.hf = Some(next!().to_string());
+                a.hf_explicit = true;
+            }
             "--steps" => {
                 a.steps = next!()
                     .parse()
@@ -175,7 +190,7 @@ fn usage() -> String {
     let d = default_args();
     let aliases = data::HF_DATASETS
         .iter()
-        .map(|(a, ..)| *a)
+        .map(|ds| ds.alias)
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -186,6 +201,7 @@ TRAINING DATA
                      https://.../resolve/main/... URL; cached in data/ and
                      reused offline. On failure, falls back locally (cached
                      file if valid, else the bundled demo corpus).
+                     Default: `{def_hf}` (allenai/c4, a ~3 MB streamed sample).
   --data <FILE>      Train on a local text file instead (overrides --hf).
 
 MODEL / TRAINING (defaults in parentheses)
@@ -227,6 +243,7 @@ executable (cargo run / target/release layouts), and created on demand.
         d.prompt,
         d.print_every,
         d.eval_every,
+        def_hf = data::DEFAULT_HF_ALIAS,
     )
 }
 

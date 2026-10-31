@@ -4,7 +4,8 @@ A complete, **working** neural network built on the Transformer design,
 implemented from scratch with **zero dependencies**. Every component —
 tokenization, embeddings, attention, all backward passes, AdamW — is
 hand-written in this crate. It trains on text pulled straight from a
-**Hugging Face dataset** (default: the classic *TinyShakespeare*).
+**Hugging Face dataset** (default: [allenai/c4](https://huggingface.co/datasets/allenai/c4),
+a ~3 MB streamed sample of the full C4 corpus).
 
 ## What it is
 
@@ -28,17 +29,24 @@ against central finite differences** by the test suite (`cargo test`).
 ## Usage
 
 ```bash
-cargo run --release                      # train on Hugging Face TinyShakespeare
+cargo run --release                      # fetch allenai/c4 (streamed sample) and train
+cargo run --release -- --hf shakespeare  # quick: TinyShakespeare instead
 cargo test  --release                    # run gradient checks + training smoke test
 ```
 
+The default configuration (5000 steps, 4 layers, d_model 128, context 128)
+trains for roughly **1.5–2 h on a 4-core laptop CPU**. For a quick smoke run
+(as in the example below), pass `--steps 500 --layers 3 --embd 96 --block 64`.
+
 Datasets are resolved in this order:
 
-1. `--hf <alias|URL>` — fetch a Hugging Face dataset (see table below) and
-   cache it in `data/`; subsequent runs reuse the cache offline.
-2. `--data FILE` — train on any local text file.
-3. Otherwise: the cached `data/tiny_shakespeare.txt` if present, else the
-   tiny bundled demo corpus (fully offline fallback).
+1. `--hf <alias|URL>` (default: `c4`) — fetch a Hugging Face dataset (see
+   table below) and cache it in `data/`; subsequent runs reuse the cache
+   offline.
+2. `--data FILE` — train on any local text file (silently overrides the
+   default `--hf`; an explicit `--hf` together with `--data` is an error).
+3. Otherwise: any cached, integrity-validated dataset file in `data/`, else
+   the tiny bundled demo corpus (fully offline fallback).
 
 Train on your own dataset and tune hyperparameters:
 
@@ -53,14 +61,14 @@ cargo run --release -- \
 
 | Flag             | Default   | Meaning                                    |
 |------------------|-----------|--------------------------------------------|
-| `--hf`           | none      | HF dataset alias (`shakespeare`) or direct `https://…/resolve/main/…` URL, cached in `data/` |
-| `--data`         | cached/defaulted | Local text file to train on instead (mutually exclusive with `--hf`) |
+| `--hf`           | `c4`      | HF dataset alias (`c4`, `shakespeare`) or direct `https://…/resolve/main/…` URL, cached in `data/` |
+| `--data`         | cached/defaulted | Local text file to train on instead |
 | `--help`, `-h`   | —         | Show full usage with defaults and exit     |
-| `--steps`        | 2000      | Training steps                              |
-| `--layers`       | 3         | Transformer blocks                          |
-| `--heads`        | 3         | Attention heads per block                   |
-| `--embd`         | 96        | Model dimension `d_model`                   |
-| `--block`        | 64        | Context length `T`                          |
+| `--steps`        | 5000      | Training steps                              |
+| `--layers`       | 4         | Transformer blocks                          |
+| `--heads`        | 4         | Attention heads per block                   |
+| `--embd`         | 128       | Model dimension `d_model`                   |
+| `--block`        | 128       | Context length `T`                          |
 | `--batch`        | 8         | Batch size `B`                              |
 | `--lr`           | 1.5e-3    | Peak AdamW learning rate                    |
 | `--wd`           | 0.1       | Decoupled weight decay (AdamW)              |
@@ -76,6 +84,7 @@ cargo run --release -- \
 
 | Alias          | HF dataset                       | Contents                          |
 |----------------|----------------------------------|-----------------------------------|
+| `c4` (default) | `allenai/c4`                     | ~3 MB · deterministic streamed sample of the C4 web-text corpus (validation split, pages of 100 rows via the HF datasets-server API) |
 | `shakespeare`  | `SamPIngram/tinyshakespeare`     | 1.1 MB · canon tiny-shakespeare char-LM corpus (40 k lines of Shakespeare) |
 
 Any direct HF resolve URL works too, e.g.:
@@ -91,6 +100,11 @@ cargo run --release -- --hf "https://huggingface.co/datasets/<user>/<repo>/resol
   on stderr and a **graceful fallback** to a local dataset (valid cache →
   `--data` file → bundled demo corpus). Passing an unknown alias errors with
   the list of known aliases.
+* **Streaming for big datasets.** `c4` is fetched without downloading the
+  gigabyte-sized archive: `allenai/c4` pages are pulled from the HF
+  datasets-server `/rows` API (100 rows per request), their `text` fields are
+  unescaped (\uXXXX incl. surrogate pairs) and joined until a ~3 MB budget
+  or page cap is reached, then cached like any other dataset.
 * **Validated cache.** Every successful download writes an integrity marker
   (`<file>.mini`) with the exact byte count. A cache file is reused only when
   the marker matches the content — truncated or unmarked files (e.g. an
@@ -110,6 +124,19 @@ Shakespeare the frequent-word prompts adapt automatically; the bundled demo
 corpus yields its own). No Shakespeare-specific hardness.
 
 ## Example run
+
+```
+dataset       : data/c4_en_validation_sample.txt (HuggingFace: allenai/c4)
+vocabulary    : 155 chars        parameters : 847 259
+architecture  : 4 layers, 4 heads, d_model = 128, ctx = 128
+batch         : 8 x 128 tokens
+...
+```
+
+(The exact block above shows the default `cargo run --release` configuration:
+5000 steps ≈ 1.5–2 h on a 4-core laptop, at ~825 tokens/sec)
+
+A Shakespeare run under the smaller vintage defaults looks like this:
 
 ```
 dataset       : data/tiny_shakespeare.txt (HuggingFace: SamPIngram/tinyshakespeare)

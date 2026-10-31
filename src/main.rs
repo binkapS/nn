@@ -8,6 +8,7 @@
 mod attention;
 mod corpus;
 mod data;
+mod engine;
 mod gpu;
 mod modules;
 mod ops;
@@ -18,9 +19,36 @@ mod transformer;
 mod tests;
 
 use data::{CharTokenizer, get_batch, load_text, split};
+use engine::GpuEngine;
 use rng::Rng;
 use std::time::Instant;
 use transformer::{Config, Gpt};
+
+#[allow(clippy::large_enum_variant)]
+enum Engine {
+    Cpu(Gpt),
+    Gpu(GpuEngine),
+}
+impl Engine {
+    fn train_step(&mut self, ids: &[usize], targets: &[usize], lr: f32, wd: f32, clip: f32) -> f32 {
+        match self {
+            Self::Cpu(m) => m.train_step(ids, targets, lr, wd, clip),
+            Self::Gpu(e) => e.train_step(ids, targets, lr, wd, clip),
+        }
+    }
+    fn eval_loss(&mut self, ids: &[usize], targets: &[usize]) -> f32 {
+        match self {
+            Self::Cpu(m) => m.eval_loss(ids, targets),
+            Self::Gpu(e) => e.eval_loss(ids, targets),
+        }
+    }
+    fn into_gpt(self) -> Gpt {
+        match self {
+            Self::Cpu(m) => m,
+            Self::Gpu(e) => e.to_gpt(),
+        }
+    }
+}
 
 struct Args {
     data: Option<String>,
@@ -309,7 +337,30 @@ fn main() {
     };
 
     let mut rng = Rng::new(args.seed);
-    let mut model = Gpt::new(cfg, &mut rng);
+    let cpu_model = Gpt::new(cfg, &mut rng);
+    let param_count = cpu_model.param_count();
+
+    // Stage 3: resolve compute engine using implemented GPU flag
+    let (mut engine, adapter_note) = match gpu::select_backend(&args.backend, true) {
+        Ok((gpu::Engine::Gpu, note)) => {
+            match GpuEngine::from_gpt(&cpu_model, args.batch) {
+                Ok(eng) => (Engine::Gpu(eng), note),
+                Err(e) => {
+                    if args.backend == "gpu" {
+                        eprintln!("GPU engine init failed: {e}");
+                        std::process::exit(1);
+                    }
+                    eprintln!("[gpu] init failed ({e}); falling back to CPU.");
+                    (Engine::Cpu(cpu_model), note)
+                }
+            }
+        }
+        Ok((gpu::Engine::Cpu, note)) => (Engine::Cpu(cpu_model), note),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
 
     println!("―――――――――――――――――――――――――――――――――――――――――――――――");
     println!("tiny GPT · decoder-only Transformer · pure Rust");
@@ -323,7 +374,8 @@ fn main() {
         cfg.n_layer, cfg.n_head, cfg.n_embd, cfg.block_size
     );
     println!("batch         : {} x {} tokens", args.batch, cfg.block_size);
-    println!("parameters    : {}", model.param_count());
+    println!("parameters    : {}", param_count);
+    println!("engine        : {}", adapter_note);
     println!("―――――――――――――――――――――――――――――――――――――――――――――――");
 
     let warmup = (0.05 * args.steps as f32) as usize;
@@ -338,7 +390,7 @@ fn main() {
     for step in 0..args.steps {
         let (inputs, targets) = get_batch(&mut rng, &train_ids, cfg.block_size, args.batch);
         let lr = schedule(step, args.steps, warmup, peak_lr, min_lr);
-        let loss = model.train_step(&inputs, &targets, lr, args.wd, 1.0);
+        let loss = engine.train_step(&inputs, &targets, lr, args.wd, 1.0);
         nchars += inputs.len();
 
         if step % args.print_every == 0 || step == args.steps - 1 {
@@ -349,7 +401,7 @@ fn main() {
             print!("{:>4}      {:>12.4}/", step, loss);
             if args.eval_every > 0 && (step % args.eval_every == 0 || step == args.steps - 1) {
                 let (vi, vt) = get_batch(&mut rng, &val_ids, cfg.block_size, args.batch);
-                let vl = model.eval_loss(&vi, &vt);
+                let vl = engine.eval_loss(&vi, &vt);
                 print!("{:<12.4}", vl);
             } else {
                 print!("{:<12}", "–");
@@ -364,13 +416,13 @@ fn main() {
     let mut vloss = 0.0f32;
     for _ in 0..eval_batches {
         let (vi, vt) = get_batch(&mut rng, &val_ids, cfg.block_size, args.batch);
-        vloss += model.eval_loss(&vi, &vt) / eval_batches as f32;
+        vloss += engine.eval_loss(&vi, &vt) / eval_batches as f32;
     }
     let train_shots = 5;
     let mut tloss = 0.0f32;
     for _ in 0..train_shots {
         let (ti, tt) = get_batch(&mut rng, &train_ids, cfg.block_size, args.batch);
-        tloss += model.eval_loss(&ti, &tt) / train_shots as f32;
+         tloss += engine.eval_loss(&ti, &tt) / train_shots as f32;
     }
     println!("―――――――――――――――――――――――――――――――――――――――――――――――");
     println!(
@@ -381,6 +433,8 @@ fn main() {
         before.elapsed().as_secs_f32()
     );
 
+    let mut gen_model = engine.into_gpt();
+
     // Sampling showcase: the user's prompt first, then dataset-agnostic
     // prompts mined from corpus word frequency (see data::sample_prompts).
     let prompts = data::sample_prompts(&text, &args.prompt);
@@ -389,7 +443,7 @@ fn main() {
         if prompt_ids.is_empty() {
             continue;
         }
-        let seq = model.generate(
+        let seq = gen_model.generate(
             &prompt_ids,
             args.max_new,
             args.temperature,

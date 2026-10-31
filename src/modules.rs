@@ -166,8 +166,8 @@ impl Linear {
 // ---------------------------------------------------------------------------
 
 pub struct LayerNorm {
-    g: Tunable,
-    b: Tunable,
+    pub(crate) g: Tunable,
+    pub(crate) b: Tunable,
     cached_x: Vec<f32>,
 }
 

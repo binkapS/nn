@@ -76,13 +76,18 @@ Each item = WGSL kernel(s) + parity test + microbenchmark line here + commit.
 
 ## Stage 3 — End-to-end gate
 
-* [ ] **3.1 Training loop on GPU**: same schedule/init/seed; CPU-vs-GPU loss
-      curves tracked within noise.
-* [ ] **3.2 CLI wiring**: `--backend` in usage/help; graceful fallback tested.
-* [ ] **3.3 Acceptance**: GPU end-to-end ≥ 2× Stage 0 baseline on the HD 520
-      at default config; all tests pass on both backends. If the iGPU
-      disappoints: bank Stage 0 wins, reassess together (options: iGPU
-      overhead autopsy, bigger default model, or accept CPU-tuned status quo).
+* [x] **3.1 Training loop on GPU**: same schedule/init/seed; CPU-vs-GPU loss
+      curves match (max diff 2.4e-7 over 16 steps on 2L/2H/32E/8T/16V,
+      b=4); implemented `src/engine.rs` (GpuEngine).
+* [x] **3.2 CLI wiring**: `--backend cpu|gpu|auto` wired into training loop
+      and generation via `Engine` enum; explicit `gpu` fails hard, `auto` falls
+      back with a note. Usage/help already documents the flag.
+* [ ] **3.3 Acceptance**: NOT met on this iGPU — GPU engine 976 ms/step
+      (≈1049 tok/s) vs Stage-0 CPU ~502 ms/step (≈2040 tok/s): ~0.52×,
+      below the 2× gate. Bank the Stage 0 wins and reassess (overhead autopsy
+      into host readbacks / per-dispatch submits, or a larger default model
+      where GPU matmuls dominate). All tests pass on both CPU and GPU paths
+      (parity 2.4e-7, clippy clean).
 
 ## Benchmark log
 

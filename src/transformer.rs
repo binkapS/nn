@@ -174,6 +174,38 @@ pub struct Config {
     pub vocab_size: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Export/import of raw parameters (for the GPU engine / snapshots).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub(crate) struct BlockParams {
+    pub ln1_g: Vec<f32>,
+    pub ln1_b: Vec<f32>,
+    pub cq_w: Vec<f32>,
+    pub cq_b: Vec<f32>,
+    pub proj_w: Vec<f32>,
+    pub proj_b: Vec<f32>,
+    pub ln2_g: Vec<f32>,
+    pub ln2_b: Vec<f32>,
+    pub fc1_w: Vec<f32>,
+    pub fc1_b: Vec<f32>,
+    pub fc2_w: Vec<f32>,
+    pub fc2_b: Vec<f32>,
+}
+
+#[derive(Clone)]
+pub(crate) struct GptParams {
+    pub cfg: Config,
+    pub tok_emb: Vec<f32>,
+    pub pos_emb: Vec<f32>,
+    pub blocks: Vec<BlockParams>,
+    pub ln_f_g: Vec<f32>,
+    pub ln_f_b: Vec<f32>,
+    pub head_w: Vec<f32>,
+    pub head_b: Vec<f32>,
+}
+
 pub struct Gpt {
     pub cfg: Config,
     tok_emb: Embedding,
@@ -380,6 +412,68 @@ impl Gpt {
             seq.push(next);
         }
         seq
+    }
+
+    pub(crate) fn export_params(&self) -> GptParams {
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for blk in &self.blocks {
+            let Block {
+                ln1,
+                attn,
+                ln2,
+                mlp,
+                ..
+            } = blk;
+            let Mlp { fc1, fc2, .. } = mlp;
+            let Attention { c_qkv, c_proj, .. } = attn;
+            blocks.push(BlockParams {
+                ln1_g: ln1.g.params.clone(),
+                ln1_b: ln1.b.params.clone(),
+                cq_w: c_qkv.w.params.clone(),
+                cq_b: c_qkv.b.params.clone(),
+                proj_w: c_proj.w.params.clone(),
+                proj_b: c_proj.b.params.clone(),
+                ln2_g: ln2.g.params.clone(),
+                ln2_b: ln2.b.params.clone(),
+                fc1_w: fc1.w.params.clone(),
+                fc1_b: fc1.b.params.clone(),
+                fc2_w: fc2.w.params.clone(),
+                fc2_b: fc2.b.params.clone(),
+            });
+        }
+        GptParams {
+            cfg: self.cfg,
+            tok_emb: self.tok_emb.w.params.clone(),
+            pos_emb: self.pos_emb.w.params.clone(),
+            blocks,
+            ln_f_g: self.ln_f.g.params.clone(),
+            ln_f_b: self.ln_f.b.params.clone(),
+            head_w: self.head.w.params.clone(),
+            head_b: self.head.b.params.clone(),
+        }
+    }
+
+    pub(crate) fn import_params(&mut self, p: &GptParams) {
+        self.tok_emb.w.params.copy_from_slice(&p.tok_emb);
+        self.pos_emb.w.params.copy_from_slice(&p.pos_emb);
+        for (blk, bp) in self.blocks.iter_mut().zip(&p.blocks) {
+            blk.ln1.g.params.copy_from_slice(&bp.ln1_g);
+            blk.ln1.b.params.copy_from_slice(&bp.ln1_b);
+            blk.attn.c_qkv.w.params.copy_from_slice(&bp.cq_w);
+            blk.attn.c_qkv.b.params.copy_from_slice(&bp.cq_b);
+            blk.attn.c_proj.w.params.copy_from_slice(&bp.proj_w);
+            blk.attn.c_proj.b.params.copy_from_slice(&bp.proj_b);
+            blk.ln2.g.params.copy_from_slice(&bp.ln2_g);
+            blk.ln2.b.params.copy_from_slice(&bp.ln2_b);
+            blk.mlp.fc1.w.params.copy_from_slice(&bp.fc1_w);
+            blk.mlp.fc1.b.params.copy_from_slice(&bp.fc1_b);
+            blk.mlp.fc2.w.params.copy_from_slice(&bp.fc2_w);
+            blk.mlp.fc2.b.params.copy_from_slice(&bp.fc2_b);
+        }
+        self.ln_f.g.params.copy_from_slice(&p.ln_f_g);
+        self.ln_f.b.params.copy_from_slice(&p.ln_f_b);
+        self.head.w.params.copy_from_slice(&p.head_w);
+        self.head.b.params.copy_from_slice(&p.head_b);
     }
 
     /// Builds exactly one row-block of tokens (`pad_context` returns a single

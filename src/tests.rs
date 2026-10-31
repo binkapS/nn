@@ -1312,3 +1312,73 @@ fn gpu_embedding_perf() {
     println!("{:<30}{:>9}{:>9}{:>10}", "(1024x155x128)", "cpu ms", "gpu ms", "ratio");
     println!("{:<30}{:>9.2}{:>9.2}{:>10.2}", "emb fwd+bwd", c_ms, g_ms, c_ms / g_ms);
 }
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_engine_parity"]
+fn gpu_engine_parity() {
+    use crate::engine::GpuEngine;
+    let cfg = Config {
+        n_layer: 2,
+        n_head: 2,
+        n_embd: 32,
+        block_size: 8,
+        vocab_size: 16,
+    };
+    let steps = 16usize;
+    let batch = 4usize;
+    let data: Vec<usize> = (0..512).map(|i| (i * 37 + 7) % 16).collect();
+
+    let mut rng_cpu = Rng::new(7);
+    let mut cpu = crate::transformer::Gpt::new(cfg, &mut rng_cpu);
+    let mut rng_gpu = Rng::new(7);
+    let base = crate::transformer::Gpt::new(cfg, &mut rng_gpu);
+    let mut engine = GpuEngine::from_gpt(&base, batch).expect("engine");
+
+    let mut rng = Rng::new(123);
+    let mut maxdiff = 0.0f32;
+    for step in 0..steps {
+        let (inputs, targets) = get_batch(&mut rng, &data, cfg.block_size, batch);
+        let lc = cpu.train_step(&inputs, &targets, 1e-3, 0.01, 1.0);
+        let lg = engine.train_step(&inputs, &targets, 1e-3, 0.01, 1.0);
+        let diff = (lc - lg).abs();
+        if diff > maxdiff { maxdiff = diff; }
+        if step == 0 {
+            assert!(diff < 2e-3, "step0 loss diff too big: {} vs {}", lc, lg);
+        }
+        println!("step {} cpu={:.6} gpu={:.6} diff={:.3e}", step, lc, lg, diff);
+    }
+    println!("maxdiff={:.3e}", maxdiff);
+    assert!(maxdiff < 0.05, "loss curve drift too high: {}", maxdiff);
+}
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_engine_perf"]
+fn gpu_engine_perf() {
+    use crate::engine::GpuEngine;
+    use std::time::Instant;
+    let cfg = Config {
+        n_layer: 4,
+        n_head: 4,
+        n_embd: 128,
+        block_size: 128,
+        vocab_size: 155,
+    };
+    let mut rng = Rng::new(1);
+    let base = crate::transformer::Gpt::new(cfg, &mut rng);
+    let mut engine = GpuEngine::from_gpt(&base, 8).expect("engine");
+    let data: Vec<usize> = (0..4096).map(|i| (i * 13 + 5) % 155).collect();
+    let mut r = Rng::new(2);
+    // warmup
+    for _ in 0..3 {
+        let (i, t) = get_batch(&mut r, &data, cfg.block_size, 8);
+        engine.train_step(&i, &t, 3e-3, 0.01, 1.0);
+    }
+    let iters = 5usize;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let (i, t) = get_batch(&mut r, &data, cfg.block_size, 8);
+        engine.train_step(&i, &t, 3e-3, 0.01, 1.0);
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    println!("GPU engine: {:.2} ms/step, {:.0} tok/s", ms, (8*128) as f64 / (ms/1000.0));
+}

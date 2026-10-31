@@ -199,6 +199,26 @@ fn gather(table: &[f32], ids: &[usize], c: usize) -> Vec<f32> {
 }
 
 #[test]
+fn schedule_edges() {
+    // schedule(step, total, warmup, peak, min_lr) must stay finite and inside
+    // [min_lr, peak] for pathological inputs too.
+    let sched = |a: usize, t: usize, w: usize| crate::schedule(a, t, w, 1.5e-3, 1.5e-4);
+
+    // total = 0 and total <= warmup must not divide by zero or truncate badly.
+    for (total, warmup) in [(0usize, 0usize), (0, 5), (3, 5), (1, 1), (100, 0)] {
+        for step in 0..(total.max(warmup) + 5) {
+            let lr = sched(step, total, warmup);
+            assert!(lr.is_finite(), "step {step} total {total} warmup {warmup} → {lr}");
+            assert!((1.4e-4..=1.51e-3).contains(&lr), "lr {lr} out of band, step {step}/{total}/{warmup}");
+        }
+    }
+    // Sanity: full run reaches min_lr at the final step, peak at warmup end.
+    let (total, warmup, peak, min) = (200usize, 10usize, 1.5e-3_f32, 1.5e-4_f32);
+    assert_eq!(crate::schedule(0, total, warmup, peak, min), peak * 1.0 / warmup as f32);
+    assert!((crate::schedule(total - 1, total, warmup, peak, min) - min).abs() < 1e-6);
+}
+
+#[test]
 fn training_reduces_loss() {
     // Full-model smoke test: loss must drop meaningfully within a few dozen
     // steps on a slice of the demo corpus.

@@ -27,8 +27,9 @@ impl AdamState {
         }
     }
 
-    /// Decoupled weight decay (AdamW): `p -= lr * ((m̂/(√v̂+ε)) + wd·p)`.
-    pub fn step(&mut self, params: &mut [f32], grads: &[f32], lr: f32) {
+    /// Conventional decoupled weight decay (AdamW):
+    /// `θ ← θ − lr·(m̂/(√v̂+ε) + wd·θ)`.
+    pub fn step(&mut self, params: &mut [f32], grads: &[f32], lr: f32, wd: f32) {
         self.step += 1;
         let t = self.step as f32;
         let bc1 = 1.0 - self.b1.powf(t);
@@ -41,7 +42,7 @@ impl AdamState {
             *v = self.b2 * *v + (1.0 - self.b2) * g * g;
             let m_hat = *m / bc1;
             let v_hat = *v / bc2;
-            params[i] -= lr * (m_hat / (v_hat.sqrt() + self.eps));
+            params[i] -= lr * (m_hat / (v_hat.sqrt() + self.eps) + wd * params[i]);
         }
     }
 }
@@ -82,10 +83,7 @@ impl Tunable {
 
     fn adam_step(&mut self, lr: f32, wd: f32) {
         let wd = if self.decay { wd } else { 0.0 };
-        if wd > 0.0 {
-            self.params.iter_mut().for_each(|p| *p *= 1.0 - lr * wd);
-        }
-        self.adam.step(&mut self.params, &self.grads, lr);
+        self.adam.step(&mut self.params, &self.grads, lr, wd);
     }
     fn init_normal(t: usize, c: usize, std: f32, decay: bool, rng: &mut Rng) -> Self {
         let params: Vec<f32> = (0..t * c).map(|_| rng.normal(0.0, std)).collect();

@@ -54,7 +54,8 @@ cargo run --release -- \
 | Flag             | Default   | Meaning                                    |
 |------------------|-----------|--------------------------------------------|
 | `--hf`           | none      | HF dataset alias (`shakespeare`) or direct `https://…/resolve/main/…` URL, cached in `data/` |
-| `--data`         | cached/defaulted | Local text file to train on instead |
+| `--data`         | cached/defaulted | Local text file to train on instead (mutually exclusive with `--hf`) |
+| `--help`, `-h`   | —         | Show full usage with defaults and exit     |
 | `--steps`        | 2000      | Training steps                              |
 | `--layers`       | 3         | Transformer blocks                          |
 | `--heads`        | 3         | Attention heads per block                   |
@@ -83,8 +84,30 @@ Any direct HF resolve URL works too, e.g.:
 cargo run --release -- --hf "https://huggingface.co/datasets/<user>/<repo>/resolve/main/<file>.txt"
 ```
 
-Downloads are cached under `data/` (git-ignored), require `curl` on the PATH,
-and fall back to the bundled corpus when unavailable.
+### Fetch semantics (robust by design)
+
+* **No panics on bad data sources.** `fetch_hf` returns a `Result`: a missing
+  `curl`, network/DNS failure, HTTP error or empty download becomes a warning
+  on stderr and a **graceful fallback** to a local dataset (valid cache →
+  `--data` file → bundled demo corpus). Passing an unknown alias errors with
+  the list of known aliases.
+* **Validated cache.** Every successful download writes an integrity marker
+  (`<file>.mini`) with the exact byte count. A cache file is reused only when
+  the marker matches the content — truncated or unmarked files (e.g. an
+  interrupted download) are silently re-fetched.
+* **Deterministic cache names.** Direct URLs are slugged from their parsed
+  `host/path` segments (sanitized, capped) plus an 8-hex FNV-1a hash of the
+  full URL, so different URLs can never collide on one cache file.
+* **CWD-independent paths.** `data/` is resolved against the CWD first, then
+  relative to the executable (covers `cargo run` and `target/release`
+  layouts), then created on demand — so the binary works from any directory.
+
+## Sampling prompts
+
+The generation showcase is dataset-agnostic: your `--prompt` goes first,
+then up to three prompts are mined from corpus word frequency (e.g. for
+Shakespeare the frequent-word prompts adapt automatically; the bundled demo
+corpus yields its own). No Shakespeare-specific hardness.
 
 ## Example run
 
@@ -130,15 +153,18 @@ converges in a few hundred steps by design.
 * **Parallelism** — matmuls, LayerNorm, softmax and GeLU run on all cores via
   `std::thread::scope` over disjoint row chunks (weight-gradient accumulation
   uses per-thread buffers reduced after join).
-* **Optimizer** — AdamW (decoupled decay, bias-corrected moments, β₂ = 0.95),
-  global-norm gradient clipping at 1.0, linear warmup (5 %) + cosine decay to
-  10 % of peak. Each module owns its gradients and moments, so no global
-  parameter registry is needed.
+* **Optimizer** — AdamW in the conventional form `θ ← θ − lr·(m̂/(√v̂+ε) + wd·θ)`
+  (decoupled decay, bias-corrected moments, β₂ = 0.95), global-norm gradient
+  clipping at 1.0, linear warmup (5 %) + cosine decay to 10 % of peak. Each
+  module owns its gradients and moments, so no global parameter registry is
+  needed.
 * **Initialization** — normal(0, 0.02) everywhere, with the residual output
   projections (attention `c_proj`, MLP `fc2`) scaled by `1/√(2·n_layers)`
   (GPT-2 style). Biases and LayerNorm scales are excluded from weight decay.
 * **Reproducibility** — a single xorshift64* RNG seeds weight init, batch
-  sampling and text generation; runs are deterministic per `--seed`.
+  sampling and text generation; runs are deterministic per `--seed`. The
+  Box–Muller sampler caches the second variate of each draw pair, so no
+  Gaussian samples are wasted.
 
 ## Source layout
 
@@ -148,8 +174,8 @@ converges in a few hundred steps by design.
 | `src/modules.rs`      | Linear / LayerNorm / Embedding + AdamW state    |
 | `src/attention.rs`    | causal multi-head self-attention + backward     |
 | `src/transformer.rs`  | Transformer block, GPT model, training step, sampling |
-| `src/data.rs`         | char tokenizer, train/val split, batch sampler  |
+| `src/data.rs`         | char tokenizer, train/val split, batch sampler, HF fetch + validated cache, prompt mining |
 | `src/corpus.rs`       | built-in offline fallback demo corpus            |
-| `src/rng.rs`          | xorshift64* PRNG + Box–Muller normal sampler     |
+| `src/rng.rs`          | xorshift64* PRNG + polar Box–Muller normal sampler (spare variate cached) |
 | `src/main.rs`         | CLI, HF/`--data` loading, training loop, schedule, eval, generation |
 | `src/tests.rs`        | finite-difference gradient checks + smoke test  |

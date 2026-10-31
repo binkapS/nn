@@ -66,7 +66,13 @@ fn default_args() -> Args {
 fn parse_args() -> Args {
     let mut a = default_args();
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    let usage = usage();
     let mut i = 0;
+    let invalid = |flag: &str, usage: &str| -> ! {
+        eprintln!("error: {flag}");
+        eprintln!("{usage}");
+        std::process::exit(2);
+    };
     while i < argv.len() {
         let (flag, val) = (argv[i].as_str(), argv.get(i + 1).map(|s| s.as_str()));
         macro_rules! next {
@@ -76,55 +82,107 @@ fn parse_args() -> Args {
                         i += 1;
                         v
                     }
-                    None => panic!("flag {flag} needs a value"),
+                    None => invalid(&format!("flag {flag} needs a value"), &usage),
                 }
             };
         }
         match flag {
+            "--help" | "-h" => {
+                print!("{usage}");
+                std::process::exit(0);
+            }
             "--data" => a.data = Some(next!().to_string()),
             "--hf" => a.hf = Some(next!().to_string()),
-            "--steps" => a.steps = next!().parse().unwrap(),
-            "--layers" => a.layers = next!().parse().unwrap(),
-            "--heads" => a.heads = next!().parse().unwrap(),
-            "--embd" => a.embd = next!().parse().unwrap(),
-            "--block" => a.block = next!().parse().unwrap(),
-            "--batch" => a.batch = next!().parse().unwrap(),
-            "--lr" => a.lr = next!().parse().unwrap(),
-            "--wd" => a.wd = next!().parse().unwrap(),
-            "--temperature" => a.temperature = next!().parse().unwrap(),
-            "--top-k" => a.top_k = next!().parse().unwrap(),
-            "--max-new" => a.max_new = next!().parse().unwrap(),
+            "--steps" => a.steps = next!().parse().unwrap_or_else(|e| invalid(&format!("--steps: {e}"), &usage)),
+            "--layers" => a.layers = next!().parse().unwrap_or_else(|e| invalid(&format!("--layers: {e}"), &usage)),
+            "--heads" => a.heads = next!().parse().unwrap_or_else(|e| invalid(&format!("--heads: {e}"), &usage)),
+            "--embd" => a.embd = next!().parse().unwrap_or_else(|e| invalid(&format!("--embd: {e}"), &usage)),
+            "--block" => a.block = next!().parse().unwrap_or_else(|e| invalid(&format!("--block: {e}"), &usage)),
+            "--batch" => a.batch = next!().parse().unwrap_or_else(|e| invalid(&format!("--batch: {e}"), &usage)),
+            "--lr" => a.lr = next!().parse().unwrap_or_else(|e| invalid(&format!("--lr: {e}"), &usage)),
+            "--wd" => a.wd = next!().parse().unwrap_or_else(|e| invalid(&format!("--wd: {e}"), &usage)),
+            "--temperature" => a.temperature = next!().parse().unwrap_or_else(|e| invalid(&format!("--temperature: {e}"), &usage)),
+            "--top-k" => a.top_k = next!().parse().unwrap_or_else(|e| invalid(&format!("--top-k: {e}"), &usage)),
+            "--max-new" => a.max_new = next!().parse().unwrap_or_else(|e| invalid(&format!("--max-new: {e}"), &usage)),
             "--prompt" => a.prompt = next!().to_string(),
-            "--seed" => a.seed = next!().parse().unwrap(),
-            "--print-every" => a.print_every = next!().parse().unwrap(),
-            "--eval-every" => a.eval_every = next!().parse().unwrap(),
-            other => panic!("unknown flag: {other}"),
+            "--seed" => a.seed = next!().parse().unwrap_or_else(|e| invalid(&format!("--seed: {e}"), &usage)),
+            "--print-every" => a.print_every = next!().parse().unwrap_or_else(|e| invalid(&format!("--print-every: {e}"), &usage)),
+            "--eval-every" => a.eval_every = next!().parse().unwrap_or_else(|e| invalid(&format!("--eval-every: {e}"), &usage)),
+            other => invalid(&format!("unknown flag: {other}"), &usage),
         }
         i += 1;
     }
     a
 }
 
+fn usage() -> String {
+    let d = default_args();
+    let aliases = data::HF_DATASETS.iter().map(|(a, ..)| *a).collect::<Vec<_>>().join(", ");
+    format!(
+        "tiny GPT — a dependency-free decoder-only Transformer in Rust
+
+TRAINING DATA
+  --hf <alias|URL>   Fetch a Hugging Face dataset (aliases: {aliases}) or a direct
+                     https://.../resolve/main/... URL; cached in data/ and
+                     reused offline. On failure, falls back locally (cached
+                     file if valid, else the bundled demo corpus).
+  --data <FILE>      Train on a local text file instead (overrides --hf).
+
+MODEL / TRAINING (defaults in parentheses)
+  --steps <n>        Training steps ({})
+  --layers <n>       Transformer blocks ({})
+  --heads <n>        Attention heads per block ({})
+  --embd <n>         Model dimension d_model ({})
+  --block <n>        Context length T ({})
+  --batch <n>        Batch size B ({})
+  --lr <f>           Peak AdamW learning rate ({:e})
+  --wd <f>           Decoupled weight decay ({})
+  --seed <u64>       RNG seed for init/batches/sampling ({})
+
+SAMPLING / OUTPUT
+  --temperature <f>  Sampling temperature; 0 = greedy ({})
+  --top-k <n>        Top-k filtering; 0 = off ({})
+  --max-new <n>      Characters generated per sample ({})
+  --prompt <s>       Your prompt for the first sample; the rest are mined
+                     from corpus word frequency ('{}')
+  --print-every <n>  Progress interval ({})
+  --eval-every <n>   Validation-loss interval ({})
+  -h, --help         Show this help and exit
+
+The data/ directory is resolved against the CWD first, then relative to the
+executable (cargo run / target/release layouts), and created on demand.
+",
+        d.steps, d.layers, d.heads, d.embd, d.block, d.batch,
+        d.lr, d.wd, d.seed,
+        d.temperature, d.top_k, d.max_new, d.prompt,
+        d.print_every, d.eval_every,
+    )
+}
+
+
 fn main() {
     let mut args = parse_args();
 
-    // Resolution order: `--hf <alias|URL>` > `--data FILE` > cached file in
-    // data/ > bundled demo corpus.
+    if args.data.is_some() && args.hf.is_some() {
+        eprintln!("error: --data and --hf are mutually exclusive — pick one dataset source");
+        eprintln!("{}", usage());
+        std::process::exit(2);
+    }
+
+    // Resolution order: `--hf <alias|URL>` (with graceful local fallback) >
+    // `--data FILE` > cached file in data/ > bundled demo corpus.
     let (text, source_label) = match &args.hf {
-        Some(hf) => data::fetch_hf(hf),
-        None => {
-            let text = load_text(&args.data);
-            let label = args.data.clone().unwrap_or_else(|| {
-                if std::path::Path::new("data/tiny_shakespeare.txt").exists() {
-                    "data/tiny_shakespeare.txt (HuggingFace: SamPIngram/tinyshakespeare)".to_string()
-                } else {
-                    "built-in demo corpus (offline fallback)".to_string()
-                }
-            });
-            (text, label)
-        }
+        Some(hf) => match data::fetch_hf(hf) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("[hf] WARNING: {e}");
+                eprintln!("[hf] falling back to a local dataset (cached/default/built-in).");
+                load_text(&args.data)
+            }
+        },
+        None => load_text(&args.data),
     };
-    args.data = Some(source_label.clone());
+    args.data = Some(source_label);
 
     let tokenizer = CharTokenizer::build(&text);
     let (train_text, val_text) = split(&text, 0.9);
@@ -145,7 +203,7 @@ fn main() {
     println!("―――――――――――――――――――――――――――――――――――――――――――――――");
     println!("tiny GPT · decoder-only Transformer · pure Rust");
     println!("―――――――――――――――――――――――――――――――――――――――――――――――");
-    println!("dataset       : {source_label}");
+    println!("dataset       : {}", args.data.as_deref().unwrap_or("?"));
     println!("vocabulary    : {} chars", cfg.vocab_size);
     println!("train tokens  : {}", train_ids.len());
     println!("val tokens    : {}", val_ids.len());
@@ -214,11 +272,9 @@ fn main() {
         before.elapsed().as_secs_f32()
     );
 
-    // Sampling showcase from a few prompts (the user's own + dataset-friendly
-    // fixed ones). Deduped in case the user picked the same prompt.
-    let mut prompts: Vec<String> = vec![args.prompt.clone(), "we ".to_string(), "our ".to_string()];
-    prompts.sort();
-    prompts.dedup();
+    // Sampling showcase: the user's prompt first, then dataset-agnostic
+    // prompts mined from corpus word frequency (see data::sample_prompts).
+    let prompts = data::sample_prompts(&text, &args.prompt);
     for prompt in &prompts {
         let prompt_ids = tokenizer.encode(prompt);
         if prompt_ids.is_empty() {

@@ -322,7 +322,7 @@ fn main() {
         vocab_size: tokenizer.vocab_size(),
     };
 
-    assert!(cfg.n_embd > 0 && cfg.n_embd % cfg.n_head == 0, "n_embd must be positive and divisible by n_head");
+    assert!(cfg.n_embd > 0 && cfg.n_embd.is_multiple_of(cfg.n_head), "n_embd must be positive and divisible by n_head");
     assert!(args.batch > 0 && args.block > 0, "batch and block must be positive");
     assert!(cfg.vocab_size > 0, "vocab_size must be positive");
     assert!(args.layers > 0 && args.heads > 0, "layers and heads must be positive");

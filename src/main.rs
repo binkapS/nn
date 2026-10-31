@@ -326,6 +326,7 @@ fn main() {
     assert!(args.batch > 0 && args.block > 0, "batch and block must be positive");
     assert!(cfg.vocab_size > 0, "vocab_size must be positive");
     assert!(args.layers > 0 && args.heads > 0, "layers and heads must be positive");
+    let mut rng = Rng::new(args.seed);
     let cpu_model = Gpt::new(cfg, &mut rng);
     let param_count = cpu_model.param_count();
 

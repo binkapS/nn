@@ -271,3 +271,51 @@ Kernel design:
 Un-fused perf at 1024×155: CPU 3.4 ms vs GPU 18.3 ms — two ~1.3 MB
 readbacks (probs + dlogits) + one (rows,) loss dominate; residency (2.7)
 turns this into a striped on-device pass.
+
+
+### Stage 2.5 — causal attention GPU kernels
+
+Parity (vs CPU `attention::Attention` composed with `ops::matmul` on both
+sides, max rel err within the 2e-3 gate):
+
+| check   | shapes (b,t,c,nh)              | max rel err |
+|---------|--------------------------------|-------------|
+| attn.fwd (out) | 1,128,128,4 / 2,128,128,4 / 2,8,16,2 / 1,13,18,3 | 2.6e-8 |
+| attn.bwd (dx)  | same                            | 4.5e-8      |
+
+Kernels (all in `GpuAttention`, shape fixed at construction):
+* `split_qkv` / `split_dh`: elementwise (B·T,3C) ↔ (bh,T,d) permute,
+  thread-per-element over b·nh·T·d.
+* `attn_fwd`: one 128-thread workgroup per (b,h); each thread owns rows
+  `i = lid, lid+WG, …` with **no barriers** — raw scores staged in the p
+  buffer as same-thread scratch, in-place max-shifted softmax, transposed
+  copies into pT (the s>i tail stays the prezeroed zero the backward
+  GEMMs read), and the output row `concat[i, h·d..]` accumulates
+  `p[i,s]·v[s]` with the first term written `=` (CPU semantics, no prezero
+  needed). Barriers were not needed anywhere: the only cross-thread
+  coupling is the (b,h) partition itself.
+* `attn_bwd_ds`: dp staged in ds as same-thread scratch, `dot`, then ds +
+  dsT written per row.
+* `batched_gemm`: per-(b,h) `y=(T,d) = ds/dsT/pT (T,T) @ q/k/v/dh (T,d)`
+  thread-per-element T·T·d — three dispatches (dq, dk, dv) since dsT/pT
+  are materialized, all operands stay row-major.
+* `scatter_dqkv`: per-head dq/dk/dv back to the fused (B·T,3C) layout.
+
+Residency slice: q/k/v/p/pT/ds/dsT/dh/dq/dk/dv + the four in/out fused
+buffers are created once and persist across forward→backward (the upper
+triangles of p/pT/ds/dsT are zero-filled once at construction and never
+rewritten). Host traffic per call is only qkv_flat in (524 KB), concat
+out, dconcat in, dqkv out at the default shape.
+
+Perf (b=8, t=128, c=128, nh=4, full compositions incl. surrounding
+GEMMs both sides): fwd ~29 vs ~29 ms, bwd ~38 vs ~38 ms — **parity, not
+a win**. The per-(b,h) workgroup split gives only b·nh=32 workgroups with
+no intra-(b,h) parallelism T²·d ≈ 0.5M ops each; an HD 520 doesn't
+overlap that deeply. The 2.7 residency pass and the (already-banked)
+fused-chaining design are where the remaining losses come out; the win
+to chant here is that the device-side 15 MB of attention scratch stops
+costing host↔device bandwidth the moment the surrounding Linears move
+on-device (Stage 3).
+
+Lesson #9: `concat!` can't pull a `const &str` into a WGSL payload —
+paste small shared struct declarations into each kernel literal.

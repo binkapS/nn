@@ -1080,3 +1080,128 @@ fn gpu_ce_perf() {
     let gpu_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
     println!("ce {rows}x{vocab}: cpu {cpu_ms:.3} ms  gpu {gpu_ms:.3} ms  (ratio {:.1}x)", cpu_ms / gpu_ms);
 }
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_attention_parity"]
+fn gpu_attention_parity() {
+    use crate::attention::Attention;
+    use crate::gpu::GpuAttention;
+    use crate::ops;
+    let tol = 2e-3;
+
+    // (b, t, c, n_head): default-like configs plus small ragged ones that
+    // stress the (b,h) workgroup indexing and row loops (t < WG, t > WG,
+    // d not power of two).
+    for &(b, t, c, nh) in
+        [(1usize, 128usize, 128usize, 4usize), (2, 128, 128, 4), (2, 8, 16, 2), (1, 13, 18, 3)]
+            .iter()
+    {
+        let d = c / nh;
+        let mut rng = Rng::new(0xAB1E_5EED);
+        let mut attn = Attention::new(nh, c, &mut rng); // CPU reference
+        let gattn = GpuAttention::new(b, t, c, nh).expect("GpuAttention");
+
+        let x: Vec<f32> = (0..b * t * c).map(|_| rng.normal(0.0, 1.0)).collect();
+        let dy: Vec<f32> = (0..b * t * c).map(|_| rng.normal(0.0, 1.0)).collect();
+
+        // ---- forward: GPU attention core between CPU-composed Linears ----
+        let qkv = ops::matmul_fwd(
+            &x, &attn.c_qkv.w.params, Some(&attn.c_qkv.b.params), b * t, c, 3 * c,
+        );
+        let concat = gattn.forward(&qkv);
+        let out_gpu = ops::matmul_fwd(
+            &concat, &attn.c_proj.w.params, Some(&attn.c_proj.b.params), b * t, c, c,
+        );
+        let out_cpu = attn.forward(&x, b, t, c);
+        let e = rel_err_max(&out_cpu, &out_gpu);
+        println!("attn fwd b={b} t={t} c={c} nh={nh} (d={d}): max rel err {e:.3e}");
+        assert!(e < tol, "attn fwd b={b} t={t}");
+
+        // ---- backward: dx through the same composition ----
+        // CPU backward runs after CPU forward (it reuses that scratch).
+        let dx_cpu = attn.backward(&dy, b, t, c);
+        // GPU path: dconcat from the c_proj GEMM backward on the GPU's own
+        // forward concat, then the attention core, then the c_qkv GEMM.
+        let (dconcat, _) = ops::matmul_bwd(&concat, &attn.c_proj.w.params, &dy, b * t, c, c);
+        let dqkv = gattn.backward(&dconcat);
+        let (dx_gpu, _) = ops::matmul_bwd(&x, &attn.c_qkv.w.params, &dqkv, b * t, c, 3 * c);
+        let e = rel_err_max(&dx_cpu, &dx_gpu);
+        println!("attn bwd dx b={b} t={t} c={c} nh={nh}: max rel err {e:.3e}");
+        assert!(e < tol, "attn bwd b={b} t={t}");
+    }
+    println!("gpu_attention_parity: all shapes within tol");
+}
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_attention_perf"]
+fn gpu_attention_perf() {
+    use crate::attention::Attention;
+    use crate::gpu::GpuAttention;
+    use crate::ops;
+    use std::hint::black_box;
+    use std::time::Instant;
+    let mut rng = Rng::new(0xBAD_5EED);
+
+    // Default-config attention: b=8, t=128, c=128, nh=4.
+    let (b, t, c, nh) = (8usize, 128usize, 128usize, 4usize);
+    let mut attn = Attention::new(nh, c, &mut rng);
+    let gattn = GpuAttention::new(b, t, c, nh).expect("GpuAttention");
+    let x: Vec<f32> = (0..b * t * c).map(|_| rng.normal(0.0, 1.0)).collect();
+    let dy: Vec<f32> = (0..b * t * c).map(|_| rng.normal(0.0, 1.0)).collect();
+    let (iters, warm) = (5usize, 2usize);
+
+    // GPU input composition mirrors the CPU composition inside the lambdas
+    // below, so both sides include the surrounding GEMMs; the difference is
+    // the attention core itself.
+    let w_qkv = attn.c_qkv.w.params.clone();
+    let b_qkv = attn.c_qkv.b.params.clone();
+    let w_proj = attn.c_proj.w.params.clone();
+    let b_proj = attn.c_proj.b.params.clone();
+    let qkv = ops::matmul_fwd(&x, &w_qkv, Some(&b_qkv), b * t, c, 3 * c);
+    let concat_gpu = gattn.forward(&qkv); // leaves q/k/v/p/pT resident for bwd
+
+    let bench = |cpu: &mut dyn FnMut(), gpu: &dyn Fn()| {
+        for _ in 0..warm {
+            cpu();
+            gpu();
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            cpu();
+        }
+        let cms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        let t = Instant::now();
+        for _ in 0..iters {
+            gpu();
+        }
+        let gms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        (cms, gms)
+    };
+
+    println!("{:<22}{:>9}{:>9}{:>10}", "(b=8 t=128 nh=4)", "cpu ms", "gpu ms", "ratio");
+    let (cpu_f, gpu_f) = bench(
+        &mut || {
+            let concat = attn.forward(&x, b, t, c);
+            black_box(ops::matmul_fwd(&concat, &attn.c_proj.w.params, Some(&attn.c_proj.b.params), b * t, c, c));
+        },
+        &|| {
+            let qkv = ops::matmul_fwd(&x, &w_qkv, Some(&b_qkv), b * t, c, 3 * c);
+            let concat = gattn.forward(&qkv);
+            black_box(ops::matmul_fwd(&concat, &w_proj, Some(&b_proj), b * t, c, c));
+        },
+    );
+    println!("{:<22}{:>9.2}{:>9.2}{:>10.2}", "attn.fwd (full)", cpu_f, gpu_f, cpu_f / gpu_f);
+
+    let (cpu_b, gpu_b) = bench(
+        &mut || {
+            black_box(attn.backward(&dy, b, t, c));
+        },
+        &|| {
+            let (dconcat, _) = ops::matmul_bwd(&concat_gpu, &w_proj, &dy, b * t, c, c);
+            let dqkv = gattn.backward(&dconcat);
+            black_box(ops::matmul_bwd(&x, &w_qkv, &dqkv, b * t, c, 3 * c).0);
+        },
+    );
+    println!("{:<22}{:>9.2}{:>9.2}{:>10.2}", "attn.bwd (full)", cpu_b, gpu_b, cpu_b / gpu_b);
+    // Note: CPU backward mutates its grads across iters; timing unaffected.
+}

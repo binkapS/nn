@@ -1277,6 +1277,585 @@ impl GpuOps {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2.5: causal attention kernels. `GpuAttention` is fixed-shape at
+// construction and keeps its attention and QKV Scratch on-device between the
+// forward and backward calls — the first real residency slice.
+// ---------------------------------------------------------------------------
+
+/// Split the fused QKV projection (B·T, 3C) into per-head buffers
+/// q/k/v, laid out flat over the (batch, head) pairs:
+/// `buf[(bi·nh + h)·T·d + tt·d + j]`. Thread-per-element over b·nh·T·d.
+const SPLIT_QKV_WGSL: &str = r#"
+struct AttnDims {
+    b: u32,     // batch
+    t: u32,     // sequence length T
+    c: u32,     // embed dim C (3C is the fused QKV width)
+    d: u32,     // per-head dim, nh = c / d
+    scale: f32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+
+@group(0) @binding(0) var<storage, read> qkv_buf: array<f32>;
+@group(0) @binding(1) var<storage, read_write> q_buf: array<f32>;
+@group(0) @binding(2) var<storage, read_write> k_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> v_buf: array<f32>;
+@group(0) @binding(4) var<uniform> dims: AttnDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let t = dims.t;
+    let c = dims.c;
+    let d = dims.d;
+    let td = t * d;
+    if (i >= dims.b * (c / d) * td) {
+        return;
+    }
+    let bh = i / td;
+    let r = i - bh * td;
+    let tt = r / d;
+    let j = r - tt * d;
+    let bi = bh / (c / d);
+    let h = bh - bi * (c / d);
+    let src = (bi * t + tt) * 3 * c;
+    let hd = h * d;
+    q_buf[i] = qkv_buf[src + hd + j];
+    k_buf[i] = qkv_buf[src + c + hd + j];
+    v_buf[i] = qkv_buf[src + 2 * c + hd + j];
+}
+"#;
+
+/// Causal attention forward, one workgroup per (batch, head) with 128
+/// threads each owning rows `i = lid, lid+WG, …` (no barriers — every
+/// thread touches only its own rows). Per row i:
+/// raw scores for s ≤ i go into p (used as same-thread scratch), then the
+/// max-shifted softmax divides them in place, transposed copies land in
+/// pT (upper triangle stays zero for the backward GEMMs), and the output
+/// row `concat[i, h·d..]` accumulates `p[i,s]·v[s]` (first term written
+/// `=` like the CPU, so no prezero of concat is needed).
+const ATTN_FWD_WGSL: &str = r#"
+struct AttnDims {
+    b: u32,     // batch
+    t: u32,     // sequence length T
+    c: u32,     // embed dim C (3C is the fused QKV width)
+    d: u32,     // per-head dim, nh = c / d
+    scale: f32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+
+@group(0) @binding(0) var<storage, read> q_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> k_buf: array<f32>;
+@group(0) @binding(2) var<storage, read> v_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> p_buf: array<f32>;
+@group(0) @binding(4) var<storage, read_write> p_t_buf: array<f32>;
+@group(0) @binding(5) var<storage, read_write> concat_buf: array<f32>;
+@group(0) @binding(6) var<uniform> dims: AttnDims;
+
+const WG: u32 = 128u;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let bh = wid.x;
+    let t = dims.t;
+    let c = dims.c;
+    let d = dims.d;
+    let nh = c / d;
+    let bi = bh / nh;
+    let h = bh - bi * nh;
+    let pbase = bh * t * t;
+
+    for (var i = lid.x; i < t; i = i + WG) {
+        let p_i = pbase + i * t;
+        // raw scores into p (s ≤ i; the s > i tail stays zero forever)
+        for (var s = 0u; s <= i; s = s + 1u) {
+            var acc = 0.0;
+            let qrow = bh * t * d + i * d;
+            let krow = bh * t * d + s * d;
+            for (var j = 0u; j < d; j = j + 1u) {
+                acc = acc + q_buf[qrow + j] * k_buf[krow + j];
+            }
+            p_buf[p_i + s] = acc * dims.scale;
+        }
+        // max + Σ over the unmasked positions only
+        var mx = -3.4e38;
+        for (var s = 0u; s <= i; s = s + 1u) {
+            mx = max(mx, p_buf[p_i + s]);
+        }
+        var z = 0.0;
+        for (var s = 0u; s <= i; s = s + 1u) {
+            z = z + exp(p_buf[p_i + s] - mx);
+        }
+        // in-place softmax + transposed copies
+        for (var s = 0u; s <= i; s = s + 1u) {
+            let e = exp(p_buf[p_i + s] - mx) / z;
+            p_buf[p_i + s] = e;
+            p_t_buf[pbase + s * t + i] = e;
+        }
+        // output row: concat[(bi·t+i), h·d..] = Σ_{s≤i} p[i,s]·v[s]
+        let dst = (bi * t + i) * c + h * d;
+        let vbase = bh * t * d;
+        for (var s = 0u; s <= i; s = s + 1u) {
+            let w = p_buf[p_i + s];
+            let vrow = vbase + s * d;
+            for (var j = 0u; j < d; j = j + 1u) {
+                concat_buf[dst + j] = select(concat_buf[dst + j] + w * v_buf[vrow + j], w * v_buf[vrow + j], s == 0u);
+            }
+        }
+    }
+}
+"#;
+
+/// Split `dconcat` (B·T, C) into per-head rows matching q/k/v layout.
+const SPLIT_DH_WGSL: &str = r#"
+struct AttnDims {
+    b: u32,     // batch
+    t: u32,     // sequence length T
+    c: u32,     // embed dim C (3C is the fused QKV width)
+    d: u32,     // per-head dim, nh = c / d
+    scale: f32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+
+@group(0) @binding(0) var<storage, read> dc_buf: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dh_buf: array<f32>;
+@group(0) @binding(2) var<uniform> dims: AttnDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let t = dims.t;
+    let c = dims.c;
+    let d = dims.d;
+    let td = t * d;
+    if (i >= dims.b * (c / d) * td) {
+        return;
+    }
+    let bh = i / td;
+    let r = i - bh * td;
+    let tt = r / d;
+    let j = r - tt * d;
+    let bi = bh / (c / d);
+    let h = bh - bi * (c / d);
+    dh_buf[i] = dc_buf[(bi * t + tt) * c + h * d + j];
+}
+"#;
+
+/// Attention backward, per-thread row `i` of each (b,h): 
+/// `dp[i,s] = ⟨dh[i], v[s]⟩` (staged in the ds buffer as same-thread scratch),
+/// `dot = Σ_s dp·p`,  `ds[i,s] = p[i,s]·(dp − dot)·scale` written to both the
+/// row-major ds buffer and its transpose (readers see the s > i tail as the
+/// prezeroed zeros the math needs).
+const ATTN_BWD_DS_WGSL: &str = r#"
+struct AttnDims {
+    b: u32,     // batch
+    t: u32,     // sequence length T
+    c: u32,     // embed dim C (3C is the fused QKV width)
+    d: u32,     // per-head dim, nh = c / d
+    scale: f32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+
+@group(0) @binding(0) var<storage, read> dh_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> v_buf: array<f32>;
+@group(0) @binding(2) var<storage, read> p_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> ds_buf: array<f32>;
+@group(0) @binding(4) var<storage, read_write> ds_t_buf: array<f32>;
+@group(0) @binding(5) var<uniform> dims: AttnDims;
+
+const WG: u32 = 128u;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let bh = wid.x;
+    let t = dims.t;
+    let d = dims.d;
+    let pbase = bh * t * t;
+    let vbase = bh * t * d;
+    let dhd = bh * t * d;
+
+    for (var i = lid.x; i < t; i = i + WG) {
+        let p_i = pbase + i * t;
+        for (var s = 0u; s <= i; s = s + 1u) {
+            var dp = 0.0;
+            let vrow = vbase + s * d;
+            for (var j = 0u; j < d; j = j + 1u) {
+                dp = dp + dh_buf[dhd + i * d + j] * v_buf[vrow + j];
+            }
+            ds_buf[p_i + s] = dp;
+        }
+        var dot = 0.0;
+        for (var s = 0u; s <= i; s = s + 1u) {
+            dot = dot + ds_buf[p_i + s] * p_buf[p_i + s];
+        }
+        for (var s = 0u; s <= i; s = s + 1u) {
+            let dsc = p_buf[p_i + s] * (ds_buf[p_i + s] - dot) * dims.scale;
+            ds_buf[p_i + s] = dsc;
+            ds_t_buf[pbase + s * t + i] = dsc;
+        }
+    }
+}
+"#;
+
+/// Batched GEMM for the head gradients: per batch slice
+/// `y (m,n) = x (m,k) @ w (k,n)` with fixed m=T k=T n=d and batch strides
+/// m·k / k·n / m·n. Thread-per-element over nb·m·n (tiny tiles, T·T·d work
+/// each — no tiling needed at this size).
+const BATCHED_GEMM_WGSL: &str = r#"
+struct BgDims {
+    nb: u32,
+    m: u32,
+    k: u32,
+    n: u32,
+}
+
+@group(0) @binding(0) var<storage, read> x_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> w_buf: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y_buf: array<f32>;
+@group(0) @binding(3) var<uniform> dims: BgDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= dims.nb * dims.m * dims.n) {
+        return;
+    }
+    let mn = dims.m * dims.n;
+    let b = i / mn;
+    let r = i - b * mn;
+    let row = r / dims.n;
+    let col = r - row * dims.n;
+    var acc = 0.0;
+    let xbase = b * dims.m * dims.k + row * dims.k;
+    let wbase = b * dims.k * dims.n;
+    for (var kk = 0u; kk < dims.k; kk = kk + 1u) {
+        acc = acc + x_buf[xbase + kk] * w_buf[wbase + kk * dims.n + col];
+    }
+    y_buf[i] = acc;
+}
+"#;
+
+/// Scatter dq/dk/dv (per-head layout) back into the fused QKV gradient
+/// (B·T, 3C). Head column ranges are exclusive, so plain writes are safe.
+const SCATTER_DQKV_WGSL: &str = r#"
+struct AttnDims {
+    b: u32,     // batch
+    t: u32,     // sequence length T
+    c: u32,     // embed dim C (3C is the fused QKV width)
+    d: u32,     // per-head dim, nh = c / d
+    scale: f32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+
+@group(0) @binding(0) var<storage, read> dq_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> dk_buf: array<f32>;
+@group(0) @binding(2) var<storage, read> dv_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> qkv_buf: array<f32>;
+@group(0) @binding(4) var<uniform> dims: AttnDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let t = dims.t;
+    let c = dims.c;
+    let d = dims.d;
+    let td = t * d;
+    if (i >= dims.b * (c / d) * td) {
+        return;
+    }
+    let bh = i / td;
+    let r = i - bh * td;
+    let tt = r / d;
+    let j = r - tt * d;
+    let bi = bh / (c / d);
+    let h = bh - bi * (c / d);
+    let hd = h * d;
+    let dst = (bi * t + tt) * 3 * c;
+    qkv_buf[dst + hd + j] = dq_buf[i];
+    qkv_buf[dst + c + hd + j] = dk_buf[i];
+    qkv_buf[dst + 2 * c + hd + j] = dv_buf[i];
+}
+"#;
+
+/// Fixed-shape GPU causal attention (`attention::Attention` core, without
+/// the surrounding Linears — compose those with `GpuGemm`/CPU). The scratch
+/// buffers (p, pT, ds, dsT, q/k/v, dh, dq/dk/dv) are created once and stay
+/// on device across forward→backward: no per-call reallocation.
+pub struct GpuAttention {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    b: usize,
+    t: usize,
+    c: usize,
+    d: usize,
+    bh: usize,
+    split_qkv: wgpu::ComputePipeline,
+    attn_fwd: wgpu::ComputePipeline,
+    split_dh: wgpu::ComputePipeline,
+    attn_bwd_ds: wgpu::ComputePipeline,
+    batched_gemm: wgpu::ComputePipeline,
+    scatter: wgpu::ComputePipeline,
+    // persistent device buffers + uniforms
+    qkv_in: wgpu::Buffer,     // (b·t, 3c) fused QKV input, host-uploaded
+    dconcat_in: wgpu::Buffer, // (b·t, c) upstream grad, host-uploaded
+    concat_out: wgpu::Buffer, // (b·t, c) attention output, host readback
+    dqkv_out: wgpu::Buffer,   // (b·t, 3c) fused QKV grad, host readback
+    q_buf: wgpu::Buffer,
+    k_buf: wgpu::Buffer,
+    v_buf: wgpu::Buffer,
+    dh_buf: wgpu::Buffer,
+    p_buf: wgpu::Buffer,
+    p_t_buf: wgpu::Buffer,
+    ds_buf: wgpu::Buffer,
+    ds_t_buf: wgpu::Buffer,
+    dq_buf: wgpu::Buffer,
+    dk_buf: wgpu::Buffer,
+    dv_buf: wgpu::Buffer,
+    attn_dims: wgpu::Buffer,
+    bg_dims: wgpu::Buffer,
+}
+
+impl GpuAttention {
+    /// Shapes are fixed: everything downstream asserts against them.
+    pub fn new(b: usize, t: usize, c: usize, n_head: usize) -> Result<Self, String> {
+        assert_eq!(c % n_head, 0, "c must split evenly among heads");
+        let Device { device, queue } = open_device()?;
+        let d = c / n_head;
+        let bh = b * n_head;
+        let split_qkv = pipeline(&device, "attn-split-qkv", SPLIT_QKV_WGSL);
+        let attn_fwd = pipeline(&device, "attn-fwd", ATTN_FWD_WGSL);
+        let split_dh = pipeline(&device, "attn-split-dh", SPLIT_DH_WGSL);
+        let attn_bwd_ds = pipeline(&device, "attn-bwd-ds", ATTN_BWD_DS_WGSL);
+        let batched_gemm = pipeline(&device, "attn-bgemm", BATCHED_GEMM_WGSL);
+        let scatter = pipeline(&device, "attn-scatter", SCATTER_DQKV_WGSL);
+
+        let scale = 1.0 / (d as f32).sqrt();
+        let attn_dims_buf = upload_uniform_u32(&device, &queue, &[
+            b as u32,
+            t as u32,
+            c as u32,
+            d as u32,
+            scale.to_bits(),
+            0u32,
+            0u32,
+            0u32,
+        ]);
+        let bg_dims_buf =
+            upload_uniform_u32(&device, &queue, &[bh as u32, t as u32, t as u32, d as u32]);
+
+        let storage = |n: usize, zero: bool| {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("attn-scratch"),
+                size: (n * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: zero,
+            });
+            if zero {
+                buf.unmap(); // zero-filled via the mapped creation path
+            }
+            buf
+        };
+        let duplex = |n: usize, label: &str, copy_src: bool| {
+            let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+            if copy_src {
+                usage |= wgpu::BufferUsages::COPY_SRC;
+            }
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (n * 4) as u64,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+
+        let qkv_in = duplex(b * t * 3 * c, "attn-qkv-in", false);
+        let dconcat_in = duplex(b * t * c, "attn-dconcat-in", false);
+        let concat_out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn-concat-out"),
+            size: (b * t * c * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let dqkv_out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn-dqkv-out"),
+            size: (b * t * 3 * c * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let q_buf = storage(bh * t * d, false);
+        let k_buf = storage(bh * t * d, false);
+        let v_buf = storage(bh * t * d, false);
+        let dh_buf = storage(bh * t * d, false);
+        let dq_buf = storage(bh * t * d, false);
+        let dk_buf = storage(bh * t * d, false);
+        let dv_buf = storage(bh * t * d, false);
+        // p / pT / ds / dsT: lower triangle written by kernels, upper tail
+        // must read zero → zero-fill at creation once.
+        let p_buf = storage(bh * t * t, true);
+        let p_t_buf = storage(bh * t * t, true);
+        let ds_buf = storage(bh * t * t, true);
+        let ds_t_buf = storage(bh * t * t, true);
+
+        Ok(Self {
+            device,
+            queue,
+            b,
+            t,
+            c,
+            d,
+            bh,
+            split_qkv,
+            attn_fwd,
+            split_dh,
+            attn_bwd_ds,
+            batched_gemm,
+            scatter,
+            qkv_in,
+            dconcat_in,
+            concat_out,
+            dqkv_out,
+            q_buf,
+            k_buf,
+            v_buf,
+            dh_buf,
+            p_buf,
+            p_t_buf,
+            ds_buf,
+            ds_t_buf,
+            dq_buf,
+            dk_buf,
+            dv_buf,
+            attn_dims: attn_dims_buf,
+            bg_dims: bg_dims_buf,
+        })
+    }
+
+    /// Attention forward given the already-computed fused QKV projection
+    /// `(b·t, 3c)`; returns the head-concatenated output `(b·t, c)` (the
+    /// caller runs c_proj on it). Leaves q/k/v/p/pT resident on device for
+    /// the matching `backward` call.
+    pub fn forward(&self, qkv_flat: &[f32]) -> Vec<f32> {
+        assert_eq!(qkv_flat.len(), self.b * self.t * 3 * self.c, "qkv shape");
+        self.queue.write_buffer(&self.qkv_in, 0, bytemuck_bytes(qkv_flat));
+
+        let n = self.bh * self.t * self.d;
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.split_qkv,
+            [ceil_div(n, 256) as u32, 1],
+            &[
+                bind(0, &self.qkv_in),
+                bind(1, &self.q_buf),
+                bind(2, &self.k_buf),
+                bind(3, &self.v_buf),
+                bind(4, &self.attn_dims),
+            ],
+        );
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.attn_fwd,
+            [self.bh as u32, 1],
+            &[
+                bind(0, &self.q_buf),
+                bind(1, &self.k_buf),
+                bind(2, &self.v_buf),
+                bind(3, &self.p_buf),
+                bind(4, &self.p_t_buf),
+                bind(5, &self.concat_out),
+                bind(6, &self.attn_dims),
+            ],
+        );
+        readback_f32(&self.device, &self.queue, &self.concat_out, self.b * self.t * self.c)
+    }
+
+    /// Attention backward given `dconcat` (the c_proj'd upstream gradient,
+    /// `(b·t, c)`); returns the fused QKV gradient `(b·t, 3c)` (the caller
+    /// runs c_qkv.backward on it). Consumes the forward call's resident
+    /// device state.
+    pub fn backward(&self, dconcat: &[f32]) -> Vec<f32> {
+        assert_eq!(dconcat.len(), self.b * self.t * self.c, "dconcat shape");
+        self.queue.write_buffer(&self.dconcat_in, 0, bytemuck_bytes(dconcat));
+
+        let n = self.bh * self.t * self.d;
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.split_dh,
+            [ceil_div(n, 256) as u32, 1],
+            &[
+                bind(0, &self.dconcat_in),
+                bind(1, &self.dh_buf),
+                bind(2, &self.attn_dims),
+            ],
+        );
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.attn_bwd_ds,
+            [self.bh as u32, 1],
+            &[
+                bind(0, &self.dh_buf),
+                bind(1, &self.v_buf),
+                bind(2, &self.p_buf),
+                bind(3, &self.ds_buf),
+                bind(4, &self.ds_t_buf),
+                bind(5, &self.attn_dims),
+            ],
+        );
+        // dq = ds@k, dk = dsT@q, dv = pT@dh — one batched kernel, 3 dispatches.
+        let gem = |x: &wgpu::Buffer, w: &wgpu::Buffer, y: &wgpu::Buffer| {
+            dispatch(
+                &self.device,
+                &self.queue,
+                &self.batched_gemm,
+                [ceil_div(n, 256) as u32, 1],
+                &[bind(0, x), bind(1, w), bind(2, y), bind(3, &self.bg_dims)],
+            );
+        };
+        gem(&self.ds_buf, &self.k_buf, &self.dq_buf);
+        gem(&self.ds_t_buf, &self.q_buf, &self.dk_buf);
+        gem(&self.p_t_buf, &self.dh_buf, &self.dv_buf);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.scatter,
+            [ceil_div(n, 256) as u32, 1],
+            &[
+                bind(0, &self.dq_buf),
+                bind(1, &self.dk_buf),
+                bind(2, &self.dv_buf),
+                bind(3, &self.dqkv_out),
+                bind(4, &self.attn_dims),
+            ],
+        );
+        readback_f32(
+            &self.device,
+            &self.queue,
+            &self.dqkv_out,
+            self.b * self.t * 3 * self.c,
+        )
+    }
+}
+
 /// Read-only-storage-size output buffer (kernel writes, host copies out).
 fn storage_out(device: &wgpu::Device, len_f32: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {

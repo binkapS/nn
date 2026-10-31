@@ -876,3 +876,116 @@ fn gpu_elementwise_perf() {
         },
     );
 }
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_optimizer_parity"]
+fn gpu_optimizer_parity() {
+    use crate::gpu::GpuOps;
+    use crate::modules::AdamState;
+    let ops = GpuOps::new().expect("GpuOps device open");
+    let mut rng = Rng::new(0xDADA_1234);
+    let tol = 1e-4; // sqrt/v̂ rounding across 5 steps accumulates a hair
+
+    for &(n, lr, wd) in [(512usize, 1e-3f32, 0.1), (1000, 1e-3, 0.0), (257, 5e-4, 0.01)].iter() {
+        let mut cpu_params: Vec<f32> = (0..n).map(|_| rng.normal(0.0, 0.02)).collect();
+        let mut cpu_adam = AdamState::new_like(&cpu_params);
+        let mut gpu_params = cpu_params.clone();
+        let mut gpu_m = vec![0.0f32; n];
+        let mut gpu_v = vec![0.0f32; n];
+
+        for step in 1..=5u32 {
+            // Same gradient sequence for both engines; real magnitudes
+            // (psot-clip grads are small), including near-zero entries.
+            let grads: Vec<f32> = (0..n).map(|_| rng.normal(0.0, 0.05)).collect();
+
+            cpu_adam.step(&mut cpu_params, &grads, lr, wd);
+            ops.adamw(
+                &mut gpu_params, &grads, &mut gpu_m, &mut gpu_v, step, lr, 0.9, 0.95, 1e-8, wd,
+            );
+
+            let e = rel_err_max(&cpu_params, &gpu_params);
+            println!("adamw step {step} n={n} lr={lr:+e} wd={wd:+e}: max rel err {e:.3e}");
+            assert!(e < tol, "adamw n={n} step={step}: rel err {e} >= {tol}");
+        }
+    }
+
+    // Gradient-norm + scale (the clip path): CPU folds f64, GPU folds 64
+    // f32 partials — plenty inside clipping tolerance.
+    let grads: Vec<f32> = (0..200_000).map(|_| rng.normal(0.0, 1.0)).collect();
+    let cpu_sq: f64 = grads.iter().map(|&g| (g as f64) * (g as f64)).sum();
+    let cpu_norm = (cpu_sq.sqrt()) as f32;
+    let gpu_norm = ops.grad_norm(&grads);
+    let rel = ((cpu_norm - gpu_norm) as f64 / cpu_norm as f64).abs();
+    println!("sqnorm n=200k: cpu {cpu_norm:.6} gpu {gpu_norm:.6} rel err {rel:.3e}");
+    assert!(rel < 2e-3, "grad norm rel {rel}");
+
+    // Scale application (clip factor), then AdamW once more on both with the
+    // same scaled grads to keep engines identical through the step.
+    let max_norm = 50.0f32;
+    let scale = if cpu_norm > max_norm { max_norm / (cpu_norm + 1e-6) } else { 1.0 };
+    let mut cpu_scaled = grads.clone();
+    for g in cpu_scaled.iter_mut() {
+        *g *= scale;
+    }
+    let mut gpu_scaled = grads.clone();
+    ops.scale_grads(&mut gpu_scaled, scale);
+    let e = rel_err_max(&cpu_scaled, &gpu_scaled);
+    println!("grad scale ×{scale:.6}: max rel err {e:.3e}");
+    assert!(e < 2e-3, "scale grads rel {e}");
+    println!("gpu_optimizer_parity: all checks within tol");
+}
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_optimizer_perf"]
+fn gpu_optimizer_perf() {
+    use crate::gpu::GpuOps;
+    use crate::modules::AdamState;
+    use std::hint::black_box;
+    use std::time::Instant;
+    let ops = GpuOps::new().expect("GpuOps device open");
+    let mut rng = Rng::new(0xBAD_5EED);
+
+    // Whole-model optimizer work: ~847k params (tok+pos emb, 4 blocks',
+    // LN, head), CPU measured at ~3.6–4.6 ms (Stage-0 table).
+    let n = 847_000usize;
+    let params: Vec<f32> = (0..n).map(|_| rng.normal(0.0, 0.02)).collect();
+    let grads: Vec<f32> = (0..n).map(|_| rng.normal(0.0, 0.05)).collect();
+    let (iters, warm) = (5usize, 2usize);
+
+    let mut cpu_p = params.clone();
+    let mut cpu_adam = AdamState::new_like(&cpu_p);
+    for _ in 0..warm {
+        cpu_adam.step(&mut cpu_p, &grads, 1e-3, 0.1);
+    }
+    let t = Instant::now();
+    for _ in 0..iters {
+        cpu_adam.step(&mut cpu_p, &grads, 1e-3, 0.1);
+        black_box(&cpu_p);
+    }
+    let cpu_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    let mut gpu_p = params.clone();
+    let mut gpu_m = vec![0.0; n];
+    let mut gpu_v = vec![0.0; n];
+    for _ in 0..warm {
+        ops.adamw(&mut gpu_p, &grads, &mut gpu_m, &mut gpu_v, 3, 1e-3, 0.9, 0.95, 1e-8, 0.1);
+    }
+    let t = Instant::now();
+    for _ in 0..iters {
+        ops.adamw(&mut gpu_p, &grads, &mut gpu_m, &mut gpu_v, 3, 1e-3, 0.9, 0.95, 1e-8, 0.1);
+        black_box(&gpu_p);
+    }
+    let gpu_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    for _ in 0..warm {
+        black_box(ops.grad_norm(&grads));
+    }
+    let t = Instant::now();
+    for _ in 0..iters+3 {
+        black_box(ops.grad_norm(&grads));
+    }
+    let gnorm_ms = t.elapsed().as_secs_f64() * 1000.0 / (iters as f64 + 3.0);
+
+    println!("adamw 847k params:   cpu {cpu_ms:.2} ms   gpu {gpu_ms:.2} ms  (ratio {:.1}×)", cpu_ms / gpu_ms);
+    println!("sqnorm clip   847k:  gpu (incl staging) {gnorm_ms:.2} ms");
+}

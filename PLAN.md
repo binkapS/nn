@@ -64,7 +64,7 @@ Each item = WGSL kernel(s) + parity test + microbenchmark line here + commit.
 * [x] **2.1 Matmul fwd + fused dgrad/wgrad backward** (biggest win; mirrored
       access patterns, transposed tiles).
 * [x] **2.2 LayerNorm fwd/bwd, GeLU fwd/bwd** (elementwise, cheap).
-* [ ] **2.3 AdamW step kernel** (elementwise update, biases/LN scales
+* [x] **2.3 AdamW step kernel** (elementwise update, biases/LN scales
       excluded from decay as on CPU).
 * [ ] **2.4 Cross-entropy softmax fwd/bwd.**
 * [ ] **2.5 Causal attention fwd** (softmax + causal mask in one pass) **and
@@ -217,3 +217,27 @@ Kernel notes:
   garbage everywhere on rows ≥ 1 (the kernel read the wrong row).
 * Lesson #7: WGSL float literals reject `_` separators mid-mantissa
   (`0.797_884_6` → parse error); write `0.7978846`.
+
+### Stage 2.3 — AdamW + gradient-norm/clip GPU kernels
+
+Parity (vs CPU, 5-step sequences incl. wd=0 and wd>0, ragged n=257/1000):
+
+| check                | max rel err |
+|----------------------|-------------|
+| adamw params (steps 1–5, 3 configs) | ≤ 3.7e-9 |
+| grad ‖·‖₂ (200k elems) | 0 (f64 host fold of f32 partials) |
+| scale_grads ×0.1118  | 0 |
+
+Un-fused perf (the 2.7 story in one number): full-model 847k-param AdamW
+step = CPU 2.6 ms vs GPU 46.8 ms — because the host ships ~20 MB of
+p/m/v/grad roundtrips per call across the staging path. The kernel itself
+is a single ~12 MB on-device pass; with residency these transfers vanish
+and the elementwise op becomes bandwidth-trivial even on the iGPU.
+sqnorm reduction incl. staging: 6.3 ms.
+
+Notes:
+* AdamW needs *duplex* buffers (`STORAGE|COPY_DST|COPY_SRC`) for every
+  in-out tensor — plain read-only uploads can't be copied back out
+  (wgpu validation error caught by the parity test).
+* The `powf` bias corrections stay host-side (no powf in WGSL core);
+  `bc1/bc2` arrive in the uniform block.

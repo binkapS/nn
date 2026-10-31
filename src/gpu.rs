@@ -716,6 +716,109 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// AdamW elementwise update, identical arithmetic to `AdamState::step`:
+/// `m = b1·m + (1−b1)·g; v = b2·v + (1−b2)·g²; θ −= lr·(m̂/(√v̂+ε) + wd·θ)`.
+/// The bias corrections `bc1/bc2` are computed on the host from the step
+/// counter (`powf` is not in WGSL core).
+const ADAMW_WGSL: &str = r#"
+struct AdamDims {
+    n: u32,
+    lr: f32,
+    b1: f32,
+    b2: f32,
+    bc1: f32,
+    bc2: f32,
+    eps: f32,
+    wd: f32,
+}
+
+@group(0) @binding(0) var<storage, read> g_buf: array<f32>;
+@group(0) @binding(1) var<storage, read_write> p_buf: array<f32>;
+@group(0) @binding(2) var<storage, read_write> m_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> v_buf: array<f32>;
+@group(0) @binding(4) var<uniform> dims: AdamDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= dims.n) {
+        return;
+    }
+    let g = g_buf[i];
+    m_buf[i] = dims.b1 * m_buf[i] + (1.0 - dims.b1) * g;
+    v_buf[i] = dims.b2 * v_buf[i] + (1.0 - dims.b2) * g * g;
+    let m_hat = m_buf[i] / dims.bc1;
+    let v_hat = v_buf[i] / dims.bc2;
+    p_buf[i] = p_buf[i] - dims.lr * (m_hat / (sqrt(v_hat) + dims.eps) + dims.wd * p_buf[i]);
+}
+"#;
+
+/// Sum-of-squares of a gradient tensor, block-reduced: each 256-thread
+/// workgroup owns a contiguous chunk, lanes stride-reduce, one shared-tree
+/// barrier finishes the block, and `o_buf[wid]` holds one f32 partial.
+/// (The final f64 fold over the 32–64 partials happens host-side, mirroring
+/// the CPU's f64 gradient-norm accumulation.)
+const SQNORM_WGSL: &str = r#"
+struct SqDims {
+    n: u32,
+    chunk: u32,   // elements per workgroup
+    pad0: u32,
+    pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> g_buf: array<f32>;
+@group(0) @binding(1) var<storage, read_write> o_buf: array<f32>;
+@group(0) @binding(2) var<uniform> dims: SqDims;
+
+const WG: u32 = 256u;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let start = wid.x * dims.chunk;
+    let end = min(start + dims.chunk, dims.n);
+
+    var acc = 0.0;
+    for (var i = start + lid.x; i < end; i = i + WG) {
+        let g = g_buf[i];
+        acc = acc + g * g;
+    }
+    red[lid.x] = acc;
+    workgroupBarrier();
+    for (var stride = WG / 2u; stride > 0u; stride = stride / 2u) {
+        if (lid.x < stride) {
+            red[lid.x] = red[lid.x] + red[lid.x + stride];
+        }
+        workgroupBarrier();
+    }
+    o_buf[wid.x] = red[0];
+}
+"#;
+
+/// Elementwise gradient scale ("multiply all grads by s") used by grad
+/// clipping; a no-op skip for `s == 1.0` is a host-side decision.
+const GRAD_SCALE_WGSL: &str = r#"
+struct ScaleDims {
+    s: f32,
+    n: u32,
+    pad0: u32,
+    pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> g_buf: array<f32>;
+@group(0) @binding(1) var<uniform> dims: ScaleDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= dims.n) {
+        return;
+    }
+    g_buf[i] = g_buf[i] * dims.s;
+}
+"#;
+
 /// Elementwise + reduction GPU ops (LayerNorm fwd/bwd, GeLU fwd/bwd).
 /// Mirrors the CPU contracts in `ops.rs` element for element.
 pub struct GpuOps {
@@ -726,6 +829,9 @@ pub struct GpuOps {
     reduce: wgpu::ComputePipeline,
     gelu_fwd: wgpu::ComputePipeline,
     gelu_bwd: wgpu::ComputePipeline,
+    adamw: wgpu::ComputePipeline,
+    sqnorm: wgpu::ComputePipeline,
+    grad_scale: wgpu::ComputePipeline,
 }
 
 impl GpuOps {
@@ -736,6 +842,9 @@ impl GpuOps {
         let reduce = pipeline(&device, "reduce-cols", REDUCE_COLS_WGSL);
         let gelu_fwd = pipeline(&device, "gelu-fwd", GELU_FWD_WGSL);
         let gelu_bwd = pipeline(&device, "gelu-bwd", GELU_BWD_WGSL);
+        let adamw = pipeline(&device, "adamw", ADAMW_WGSL);
+        let sqnorm = pipeline(&device, "sqnorm", SQNORM_WGSL);
+        let grad_scale = pipeline(&device, "grad-scale", GRAD_SCALE_WGSL);
         Ok(Self {
             device,
             queue,
@@ -744,6 +853,9 @@ impl GpuOps {
             reduce,
             gelu_fwd,
             gelu_bwd,
+            adamw,
+            sqnorm,
+            grad_scale,
         })
     }
 
@@ -875,6 +987,120 @@ impl GpuOps {
         );
         readback_f32(&self.device, &self.queue, &dx_buf, x.len())
     }
+
+    /// One AdamW step over a whole tensor: `AdamState::step` semantics.
+    /// Bias corrections from `step` are computed host-side; `m`/`v` are the
+    /// persistent moments (returned updated), `wd` is pre-gated by the
+    /// caller for decay-excluded tensors (biases, LN scales).
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw(
+        &self,
+        params: &mut [f32],
+        grads: &[f32],
+        m: &mut [f32],
+        v: &mut [f32],
+        step: u32,
+        lr: f32,
+        b1: f32,
+        b2: f32,
+        eps: f32,
+        wd: f32,
+    ) {
+        let n = params.len();
+        assert_eq!(grads.len(), n);
+        assert_eq!(m.len(), n);
+        assert_eq!(v.len(), n);
+        let t = step as f32;
+        let bc1 = 1.0 - b1.powf(t);
+        let bc2 = 1.0 - b2.powf(t);
+        let dims: [u32; 8] = [
+            n as u32,
+            lr.to_bits(),
+            b1.to_bits(),
+            b2.to_bits(),
+            bc1.to_bits(),
+            bc2.to_bits(),
+            eps.to_bits(),
+            wd.to_bits(),
+        ];
+        let g_buf = upload_f32(&self.device, &self.queue, grads);
+        let p_buf = buffer_f32_duplex(&self.device, n);
+        let m_buf = buffer_f32_duplex(&self.device, n);
+        let v_buf = buffer_f32_duplex(&self.device, n);
+        self.queue.write_buffer(&p_buf, 0, bytemuck_bytes(params));
+        self.queue.write_buffer(&m_buf, 0, bytemuck_bytes(m));
+        self.queue.write_buffer(&v_buf, 0, bytemuck_bytes(v));
+        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.adamw,
+            [ceil_div(n, 256) as u32, 1],
+            &[
+                bind(0, &g_buf),
+                bind(1, &p_buf),
+                bind(2, &m_buf),
+                bind(3, &v_buf),
+                bind(4, &dims_buf),
+            ],
+        );
+        let p_out = readback_f32(&self.device, &self.queue, &p_buf, n);
+        params.copy_from_slice(&p_out);
+        let m_out = readback_f32(&self.device, &self.queue, &m_buf, n);
+        m.copy_from_slice(&m_out);
+        let v_out = readback_f32(&self.device, &self.queue, &v_buf, n);
+        v.copy_from_slice(&v_out);
+    }
+
+    /// ‖g‖₂ over one gradient tensor, for grad clipping. GPU computes 64
+    /// (or fewer) workgroup partials in f32; the host folds them in f64 —
+    /// matching the CPU's f64 `total_grad_sq` accumulation exactly in
+    /// structure, to rounding within f32 partials.
+    pub fn grad_norm(&self, grads: &[f32]) -> f32 {
+        let n = grads.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let workgroups = 64usize.min(n.div_ceil(256));
+        let chunk = n.div_ceil(workgroups); // fits u32 for model-scale tensors (< 2^32 / 256)
+        let dims = [n as u32, chunk as u32, 0u32, 0u32];
+        let g_buf = upload_f32(&self.device, &self.queue, grads);
+        let o_buf = storage_out(&self.device, workgroups);
+        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.sqnorm,
+            [workgroups as u32, 1],
+            &[bind(0, &g_buf), bind(1, &o_buf), bind(2, &dims_buf)],
+        );
+        let partials = readback_f32(&self.device, &self.queue, &o_buf, workgroups);
+        // Each partial is already a sum of squares; fold plainly (no-repeat
+        // the square like the host would with raw values).
+        let sq_total: f64 = partials.iter().map(|&p| p as f64).sum();
+        sq_total.sqrt() as f32
+    }
+
+    /// In-place `grads *= s` (the clipping scale application).
+    pub fn scale_grads(&self, grads: &mut [f32], s: f32) {
+        if s == 1.0 {
+            return;
+        }
+        let n = grads.len();
+        let dims: [u32; 4] = [s.to_bits(), n as u32, 0, 0];
+        let g_buf = buffer_f32_duplex(&self.device, n);
+        self.queue.write_buffer(&g_buf, 0, bytemuck_bytes(grads));
+        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.grad_scale,
+            [ceil_div(n, 256) as u32, 1],
+            &[bind(0, &g_buf), bind(1, &dims_buf)],
+        );
+        let g_out = readback_f32(&self.device, &self.queue, &g_buf, n);
+        grads.copy_from_slice(&g_out);
+    }
 }
 
 /// Read-only-storage-size output buffer (kernel writes, host copies out).
@@ -883,6 +1109,19 @@ fn storage_out(device: &wgpu::Device, len_f32: usize) -> wgpu::Buffer {
         label: Some("gpu-out"),
         size: (len_f32 * 4) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+/// In-out storage buffer: host writes via COPY_DST, kernel mutates, host
+/// reads back via COPY_SRC (needed for in-place ops like AdamW).
+fn buffer_f32_duplex(device: &wgpu::Device, len_f32: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gpu-inout"),
+        size: (len_f32 * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })
 }

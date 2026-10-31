@@ -240,8 +240,8 @@ TRAINING DATA
 
 MODEL / TRAINING (defaults in parentheses)
   --backend <s>      Compute engine: cpu | gpu | auto ({})
-                     GPU kernels land in Stage 2 (PLAN.md); until then all
-                     backends train on CPU — auto/gpu still probe hardware.
+                     gpu uses the wgpu backend (fails hard if no adapter);
+                     auto prefers gpu when available, else cpu.
   --steps <n>        Training steps ({})
   --layers <n>       Transformer blocks ({})
   --heads <n>        Attention heads per block ({})
@@ -293,20 +293,6 @@ fn main() {
         eprintln!("{}", usage());
         std::process::exit(2);
     }
-
-    // Stage 1: resolve the compute engine. GPU kernels are not ported yet
-    // (Stage 2), so `auto`/`gpu` probe the adapter and report; training stays
-    // on CPU until kernels land.
-    let (engine, adapter_note) = match gpu::select_backend(&args.backend, false) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("error: {e}");
-            eprintln!("{}", usage());
-            std::process::exit(2);
-        }
-    };
-    let _ = engine; // used once GPU kernels land (Stage 2)
-    eprintln!("[engine] {adapter_note}");
 
     // Resolution order: `--hf <alias|URL>` (with graceful local fallback) >
     // `--data FILE` > cached file in data/ > bundled demo corpus.

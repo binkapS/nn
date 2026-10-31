@@ -30,6 +30,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 const LN_EPS: f32 = 1e-5;
 
+const TRANSPOSE_WGSL: &str = r#"
+struct Dims { in_d: u32, out_d: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> in_buf: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out_buf: array<f32>;
+@group(0) @binding(2) var<uniform> dims: Dims;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let n = dims.in_d * dims.out_d;
+    if (i >= n) { return; }
+    let row = i / dims.out_d;
+    let col = i % dims.out_d;
+    out_buf[col * dims.in_d + row] = in_buf[i];
+}
+"#;
+
 struct ParamBuf {
     n: usize,
     decay: bool,
@@ -75,6 +91,7 @@ pub struct GpuEngine {
     split_dh: wgpu::ComputePipeline, attn_bwd_ds: wgpu::ComputePipeline,
     batched_gemm: wgpu::ComputePipeline, scatter: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline, fill: wgpu::ComputePipeline,
+    transpose_pipe: wgpu::ComputePipeline,
 
     cfg: Config, b: usize, t: usize, c: usize, v: usize, nh: usize, d: usize,
     rows: usize, n_layer: usize,
@@ -240,6 +257,7 @@ impl GpuEngine {
         let scatter=gpu::pipeline(&device,"attn-scatter",gpu::SCATTER_DQKV_WGSL);
         let add=gpu::pipeline(&device,"add",ADD_WGSL);
         let fill=gpu::pipeline(&device,"fill",FILL_WGSL);
+        let transpose_pipe=gpu::pipeline(&device,"transpose_pipe",TRANSPOSE_WGSL);
         let pool=RefCell::new(gpu::Pool::default());
 
         let mut blocks=Vec::with_capacity(n_layer);
@@ -312,47 +330,27 @@ impl GpuEngine {
         Ok(Self { device,queue,pool,
             gemm_fwd, gemm_dwt, ln_fwd, ln_bwd, reduce, gelu_fwd, gelu_bwd, adamw, sqnorm, grad_scale,
             ce_fwd, ce_bwd, emb_fwd, emb_bwd, split_qkv, attn_fwd:attn_fwd_p, split_dh, attn_bwd_ds,
-            batched_gemm, scatter, add, fill,
+            batched_gemm, scatter, add, fill, transpose_pipe,
             cfg,b,t,c,v,nh,d,rows,n_layer,
             tok_emb,pos_emb,blocks,ln_f_g,ln_f_b,head_w,head_b,
             x_stream,blk_x1,blk_ln1out,blk_ln2out,blk_fc1out,blk_qkv,blk_attnout,attns,ln_f_out,logits_buf,probs,loss_buf,tmp_rc,tmp_4rc,sc1_rc,sc2_rc,sc3_rc,sc4rc,
             token_ids_buf,target_ids_buf,pos_ids_buf,step:0 })
     }
 
-    pub fn train_step(&mut self, ids:&[usize], targets:&[usize], lr:f32, wd:f32, clip:f32) -> f32 {
-        let n_layer=self.n_layer; let c=self.c; let _t=self.t; let _b=self.b; let rows=self.rows; let v=self.v;
-        let pool=&self.pool;
+    pub fn forward_pass(&mut self, ids: &[usize], targets: &[usize]) -> f32 {
+        let pool = &self.pool;
+        let n_layer=self.n_layer; let c=self.c; let rows=self.rows; let v=self.v; let _b=self.b; let _nh=self.nh; let t=self.t;
+        let _=t;
+        // upload ids
         let ids_u: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
         let tgt_u: Vec<u32> = targets.iter().map(|&x| x as u32).collect();
-        self.token_ids_buf=gpu::upload_u32_storage(&self.device,&self.queue,&ids_u);
-        self.target_ids_buf=gpu::upload_u32_storage(&self.device,&self.queue,&tgt_u);
+        let mut ib = Vec::with_capacity(ids_u.len()*4);
+        for u in &ids_u { ib.extend_from_slice(&u.to_le_bytes()); }
+        self.queue.write_buffer(&self.token_ids_buf, 0, &ib);
+        let mut tb = Vec::with_capacity(tgt_u.len()*4);
+        for u in &tgt_u { tb.extend_from_slice(&u.to_le_bytes()); }
+        self.queue.write_buffer(&self.target_ids_buf, 0, &tb);
 
-        // zero grads
-        let z=|buf:&wgpu::Buffer,n:usize,dev:&Self| { zero_duplex(&dev.fill, &dev.device,&dev.queue,pool,buf,n); };
-        // explicit:
-        zero_duplex(&self.fill,&self.device,&self.queue,pool,&self.tok_emb.grad,self.tok_emb.n);
-        zero_duplex(&self.fill,&self.device,&self.queue,pool,&self.pos_emb.grad,self.pos_emb.n);
-        for i in 0..n_layer { let bp=&self.blocks[i];
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.ln1_g.grad,bp.ln1_g.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.ln1_b.grad,bp.ln1_b.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.cq_w.grad,bp.cq_w.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.cq_b.grad,bp.cq_b.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.proj_w.grad,bp.proj_w.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.proj_b.grad,bp.proj_b.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.ln2_g.grad,bp.ln2_g.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.ln2_b.grad,bp.ln2_b.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.fc1_w.grad,bp.fc1_w.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.fc1_b.grad,bp.fc1_b.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.fc2_w.grad,bp.fc2_w.n);
-            zero_duplex(&self.fill,&self.device,&self.queue,pool,&bp.fc2_b.grad,bp.fc2_b.n);
-        }
-        zero_duplex(&self.fill,&self.device,&self.queue,pool,&self.ln_f_g.grad,self.ln_f_g.n);
-        zero_duplex(&self.fill,&self.device,&self.queue,pool,&self.ln_f_b.grad,self.ln_f_b.n);
-        zero_duplex(&self.fill,&self.device,&self.queue,pool,&self.head_w.grad,self.head_w.n);
-        zero_duplex(&self.fill,&self.device,&self.queue,pool,&self.head_b.grad,self.head_b.n);
-        let _=z;
-
-        // FORWARD
         // tok emb
         {
             let n=rows*c;
@@ -471,7 +469,43 @@ impl GpuEngine {
         }
         let loss_vals=gpu::readback_f32(&self.device,&self.queue,&self.loss_buf,rows);
         let loss:f32={ let s:f64=loss_vals.iter().map(|&x|x as f64).sum(); (s/rows as f64) as f32 };
+        loss
+    }
 
+    pub fn train_step(&mut self, ids:&[usize], targets:&[usize], lr:f32, wd:f32, clip:f32) -> f32 {
+        let n_layer=self.n_layer; let c=self.c; let _t=self.t; let _b=self.b; let rows=self.rows; let v=self.v;
+        let ids_u: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
+        let tgt_u: Vec<u32> = targets.iter().map(|&x| x as u32).collect();
+        self.token_ids_buf=gpu::upload_u32_storage(&self.device,&self.queue,&ids_u);
+        self.target_ids_buf=gpu::upload_u32_storage(&self.device,&self.queue,&tgt_u);
+
+        // zero grads
+        let z=|buf:&wgpu::Buffer,n:usize,dev:&Self| { zero_duplex(&dev.fill, &dev.device,&dev.queue,&self.pool,buf,n); };
+        // explicit:
+        zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&self.tok_emb.grad,self.tok_emb.n);
+        zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&self.pos_emb.grad,self.pos_emb.n);
+        for i in 0..n_layer { let bp=&self.blocks[i];
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.ln1_g.grad,bp.ln1_g.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.ln1_b.grad,bp.ln1_b.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.cq_w.grad,bp.cq_w.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.cq_b.grad,bp.cq_b.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.proj_w.grad,bp.proj_w.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.proj_b.grad,bp.proj_b.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.ln2_g.grad,bp.ln2_g.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.ln2_b.grad,bp.ln2_b.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.fc1_w.grad,bp.fc1_w.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.fc1_b.grad,bp.fc1_b.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.fc2_w.grad,bp.fc2_w.n);
+            zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&bp.fc2_b.grad,bp.fc2_b.n);
+        }
+        zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&self.ln_f_g.grad,self.ln_f_g.n);
+        zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&self.ln_f_b.grad,self.ln_f_b.n);
+        zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&self.head_w.grad,self.head_w.n);
+        zero_duplex(&self.fill,&self.device,&self.queue,&self.pool,&self.head_b.grad,self.head_b.n);
+        let _=z;
+
+        let loss = self.forward_pass(ids, targets);
+        let pool=&self.pool;
         // BACKWARD
         // CE bwd
         {
@@ -728,9 +762,9 @@ impl GpuEngine {
                 gpu::bind(2,&param.m),gpu::bind(3,&param.v),gpu::bind(4,&ub)]);
             gpu::pool_release(pool,vec![ub]);
             if let Some(dt)=&param.data_t {
-                let host=gpu::readback_f32(&self.device,&self.queue,&param.data,param.n);
-                let td=transpose(&host,param.shape_in,param.shape_out);
-                self.queue.write_buffer(dt,0,gpu::bytemuck_bytes(&td));
+                let ub=make_uniform_u32(&self.device,&self.queue,&[param.shape_in as u32,param.shape_out as u32,0,0]);
+                gpu::dispatch(&self.device,&self.queue,&self.transpose_pipe,[gpu::ceil_div(param.n,256) as u32,1],&[
+                    gpu::bind(0,&param.data), gpu::bind(1,dt), gpu::bind(2,&ub)]);
             }
         }
         // blocks
@@ -748,9 +782,9 @@ impl GpuEngine {
                     gpu::bind(2,&p.m),gpu::bind(3,&p.v),gpu::bind(4,&ub)]);
                 gpu::pool_release(pool,vec![ub]);
                 if let Some(dt)=&p.data_t {
-                    let host=gpu::readback_f32(&self.device,&self.queue,&p.data,p.n);
-                    let td=transpose(&host,p.shape_in,p.shape_out);
-                    self.queue.write_buffer(dt,0,gpu::bytemuck_bytes(&td));
+                    let ub=make_uniform_u32(&self.device,&self.queue,&[p.shape_in as u32,p.shape_out as u32,0,0]);
+                    gpu::dispatch(&self.device,&self.queue,&self.transpose_pipe,[gpu::ceil_div(p.n,256) as u32,1],&[
+                        gpu::bind(0,&p.data), gpu::bind(1,dt), gpu::bind(2,&ub)]);
                 }
             }
         }
@@ -767,9 +801,9 @@ impl GpuEngine {
                 gpu::bind(2,&param.m),gpu::bind(3,&param.v),gpu::bind(4,&ub)]);
             gpu::pool_release(pool,vec![ub]);
             if let Some(dt)=&param.data_t {
-                let host=gpu::readback_f32(&self.device,&self.queue,&param.data,param.n);
-                let td=transpose(&host,param.shape_in,param.shape_out);
-                self.queue.write_buffer(dt,0,gpu::bytemuck_bytes(&td));
+                let ub=make_uniform_u32(&self.device,&self.queue,&[param.shape_in as u32,param.shape_out as u32,0,0]);
+                gpu::dispatch(&self.device,&self.queue,&self.transpose_pipe,[gpu::ceil_div(param.n,256) as u32,1],&[
+                    gpu::bind(0,&param.data), gpu::bind(1,dt), gpu::bind(2,&ub)]);
             }
         }
 
@@ -807,10 +841,7 @@ impl GpuEngine {
         gpt
     }
 
-    pub fn eval_loss(&self, ids:&[usize], targets:&[usize]) -> f32 {
-        // Not fully implemented; fallback via to_gpt cpu would be costly; skip
-        // Implement simple forward readback using train_step? Instead convert
-        let mut gpt=self.to_gpt(); // potentially expensive
-        gpt.eval_loss(ids,targets)
+    pub fn eval_loss(&mut self, ids:&[usize], targets:&[usize]) -> f32 {
+        self.forward_pass(ids, targets)
     }
 }

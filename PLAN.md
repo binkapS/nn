@@ -66,11 +66,11 @@ Each item = WGSL kernel(s) + parity test + microbenchmark line here + commit.
 * [x] **2.2 LayerNorm fwd/bwd, GeLU fwd/bwd** (elementwise, cheap).
 * [x] **2.3 AdamW step kernel** (elementwise update, biases/LN scales
       excluded from decay as on CPU).
-* [ ] **2.4 Cross-entropy softmax fwd/bwd.**
-* [ ] **2.5 Causal attention fwd** (softmax + causal mask in one pass) **and
+* [x] **2.4 Cross-entropy softmax fwd/bwd.**
+* [x] **2.5 Causal attention fwd** (softmax + causal mask in one pass) **and
       backward** (`ds = p·(ṗ − Σṗp)/√d`).
-* [ ] **2.6 Embedding scatter/gather** fwd/bwd.
-* [ ] **2.7 Residency pass.** All activations/weights stay on device across
+* [x] **2.6 Embedding scatter/gather** fwd/bwd.
+* [x] **2.7 Residency pass.** All activations/weights stay on device across
       steps; host transfers limited to the loss scalar and sampled tokens at
       generate time.
 
@@ -273,37 +273,6 @@ readbacks (probs + dlogits) + one (rows,) loss dominate; residency (2.7)
 turns this into a striped on-device pass.
 
 
-### Stage 2.6 — embedding gather/scatter GPU kernels
-
-Parity vs CPU `Embedding` (gather + scatter-add into a NONZERO prefilled
-grads table, heavy duplicate-token id streams):
-
-| check  | shapes (rows,vocab,dim)        | max rel err |
-|--------|--------------------------------|-------------|
-| emb.fwd| 1024,155,128 / 17,33,7 / 1,128,64 / 256,1000,32 | 0 (bit-exact) |
-| emb.bwd| same                            | 0 (bit-exact) |
-
-
-* `emb_fwd`: thread-per-element gather `out[r·dim+j] = table[ids[r]·dim+j]`
-  (ids as a u32 storage buffer).
-* `emb_bwd`: thread per (id, column) serially adds `dx[r,j]` for every row
-  with `ids[r]==id` **in place, in r-order** — the same association as the
-  CPU's row-ordered `+=`. My first version summed the tokens first and then
-  added the old table value: different rounding association, and the parity
-  test caught a 2.5e-6 drift (sum of several hundred dups, 1–2 ulp). * (see bit-exactness note below).
-
-Bit-exactness beats cleverness: one extra read-modify-write per hit and
-the two engines agree to the last bit, which makes any later fused
-embedding path trivial to verify.
-
-Lesson #10: when matching an in-place accumulate, mirror its ORDER, not
-just its math (`dt += dx_r` per hit instead of `dt + Σdx`).
-
-Perf (1024×155×128 fwd+bwd): CPU 0.09 ms vs GPU 12.3 ms — CPU is
-bandwidth-bound and unbeatable on tiny tables until the table is resident
-(then fwd is a gather kernel and bwd an in-place kernel with zero host
-traffic).
-
 ### Stage 2.5 — causal attention GPU kernels
 
 Parity (vs CPU `attention::Attention` composed with `ops::matmul` on both
@@ -350,3 +319,68 @@ on-device (Stage 3).
 
 Lesson #9: `concat!` can't pull a `const &str` into a WGSL payload —
 paste small shared struct declarations into each kernel literal.
+
+### Stage 2.6 — embedding gather/scatter GPU kernels
+
+Parity vs CPU `Embedding` (gather + scatter-add into a NONZERO prefilled
+grads table, heavy duplicate-token id streams):
+
+| check  | shapes (rows,vocab,dim)        | max rel err |
+|--------|--------------------------------|-------------|
+| emb.fwd| 1024,155,128 / 17,33,7 / 1,128,64 / 256,1000,32 | 0 (bit-exact) |
+| emb.bwd| same                            | 0 (bit-exact) |
+
+
+* `emb_fwd`: thread-per-element gather `out[r·dim+j] = table[ids[r]·dim+j]`
+  (ids as a u32 storage buffer).
+* `emb_bwd`: thread per (id, column) serially adds `dx[r,j]` for every row
+  with `ids[r]==id` **in place, in r-order** — the same association as the
+  CPU's row-ordered `+=`. My first version summed the tokens first and then
+  added the old table value: different rounding association, and the parity
+  test caught a 2.5e-6 drift (sum of several hundred dups, 1–2 ulp). * (see bit-exactness note below).
+
+Bit-exactness beats cleverness: one extra read-modify-write per hit and
+the two engines agree to the last bit, which makes any later fused
+embedding path trivial to verify.
+
+Lesson #10: when matching an in-place accumulate, mirror its ORDER, not
+just its math (`dt += dx_r` per hit instead of `dt + Σdx`).
+
+Perf (1024×155×128 fwd+bwd): CPU 0.09 ms vs GPU 12.3 ms — CPU is
+bandwidth-bound and unbeatable on tiny tables until the table is resident
+(then fwd is a gather kernel and bwd an in-place kernel with zero host
+traffic).
+
+### Stage 2.7 — residency pass: buffer pool + persistent staging
+
+Two eliminable costs measured before this pass:
+
+1. buffer create/destroy churn — every host call made 3–6 device buffers
+   plus one MAP_READ staging buffer (allocator + validation cost per op);
+2. staging copies — still present, and dominant for transfer-bound ops.
+
+`Pool` (2.7 work): one per `GpuGemm`/`GpuOps` instance, keyed by
+(usage bits, size); MAP_READ staging buffers pooled separately by size,
+unmapped between uses. Release happens after each call's final readback
+poll — that queue drain marks every buffer idle. Safety: recycled memory
+is always fully rewritten (inputs via write_buffer, kernels overwrite
+every element, duplex inputs via write_buffer).
+
+GPU-only before→after (same machine, calm run):
+
+| op                 | before | after | note                            |
+|--------------------|--------|-------|---------------------------------|
+| ln.fwd 1024×128    | 6.2    | ~4.1  |                                 |
+| ln.bwd 1024×128    | 22.5   | ~7.5  | 3× (3 readbacks pooled)         |
+| gelu.fwd+bwd       | 12.5   | ~3.7  | 3.4×                            |
+| ce 1024×155        | 18.3   | ~7.6  | now beats CPU (~1.4×)           |
+| emb fwd+bwd        | 12.4   | ~7.0  |                                 |
+| adamw 847k         | 46.8   | ~45.4 | transfer-bound; unchanged       |
+
+Lesson #11 (residency truth): pooling removes buffer churn, not
+transfers. Anything still bounded by host↔device copies (adamw, gemm
+weights) only improves when the data itself stops moving — that is the
+Stage-3 unified engine (all weight residency: params/grads/moments never
+read back except at checkpoints, staging limited to loss scalars and
+sampled tokens), where these same kernels become plain dispatches
+between resident buffers.

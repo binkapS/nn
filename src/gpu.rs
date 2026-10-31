@@ -378,6 +378,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 pub struct GpuGemm {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    pool: core::cell::RefCell<Pool>,
     fwd_pipeline: wgpu::ComputePipeline,
     dwt_pipeline: wgpu::ComputePipeline,
 }
@@ -390,6 +391,7 @@ impl GpuGemm {
         Ok(Self {
             device,
             queue,
+            pool: core::cell::RefCell::new(Pool::default()),
             fwd_pipeline,
             dwt_pipeline,
         })
@@ -417,11 +419,11 @@ impl GpuGemm {
         };
         let dims = [m as u32, k as u32, n as u32, use_bias];
 
-        let x_buf = upload_f32(&self.device, &self.queue, x);
-        let wt_buf = upload_f32(&self.device, &self.queue, wt);
-        let bias_buf = upload_f32(&self.device, &self.queue, &bias_data);
-        let y_buf = storage_out(&self.device, m * n);
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let x_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, x);
+        let wt_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, wt);
+        let bias_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, &bias_data);
+        let y_buf = pool_out(&self.pool, &self.device, m * n);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
 
         dispatch(
             &self.device,
@@ -436,7 +438,9 @@ impl GpuGemm {
                 bind(4, &dims_buf),
             ],
         );
-        readback_f32(&self.device, &self.queue, &y_buf, m * n)
+        let y = pool_readback_f32(&self.pool, &self.device, &self.queue, &y_buf, m * n);
+        pool_release(&self.pool, vec![x_buf, wt_buf, bias_buf, y_buf, dims_buf]);
+        y
     }
 
     /// `(dx (M,K), dwt (K,N))` through `y = x @ wt`: same contract as
@@ -468,10 +472,10 @@ impl GpuGemm {
 
         // dwt = xᵀ @ gy via the dedicated kernel.
         let dims = [m as u32, k as u32, n as u32, 0u32];
-        let x_buf = upload_f32(&self.device, &self.queue, x);
-        let gy_buf = upload_f32(&self.device, &self.queue, gy);
-        let dwt_buf = storage_out(&self.device, k * n);
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let x_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, x);
+        let gy_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, gy);
+        let dwt_buf = pool_out(&self.pool, &self.device, k * n);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
 
         dispatch(
             &self.device,
@@ -485,7 +489,8 @@ impl GpuGemm {
                 bind(3, &dims_buf),
             ],
         );
-        let dwt = readback_f32(&self.device, &self.queue, &dwt_buf, k * n);
+        let dwt = pool_readback_f32(&self.pool, &self.device, &self.queue, &dwt_buf, k * n);
+        pool_release(&self.pool, vec![x_buf, gy_buf, dwt_buf, dims_buf]);
         (dx, dwt)
     }
 }
@@ -1006,6 +1011,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 pub struct GpuOps {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    pool: core::cell::RefCell<Pool>,
     ln_fwd: wgpu::ComputePipeline,
     ln_bwd: wgpu::ComputePipeline,
     reduce: wgpu::ComputePipeline,
@@ -1038,6 +1044,7 @@ impl GpuOps {
         Ok(Self {
             device,
             queue,
+            pool: core::cell::RefCell::new(Pool::default()),
             ln_fwd,
             ln_bwd,
             reduce,
@@ -1070,11 +1077,11 @@ impl GpuOps {
             return Vec::new();
         }
         let dims = [rows as u32, c as u32, eps.to_bits(), 0u32];
-        let x_buf = upload_f32(&self.device, &self.queue, x);
-        let g_buf = upload_f32(&self.device, &self.queue, g);
-        let b_buf = upload_f32(&self.device, &self.queue, b);
-        let y_buf = storage_out(&self.device, rows * c);
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let x_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, x);
+        let g_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, g);
+        let b_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, b);
+        let y_buf = pool_out(&self.pool, &self.device, rows * c);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
         dispatch(
             &self.device,
             &self.queue,
@@ -1088,7 +1095,9 @@ impl GpuOps {
                 bind(4, &dims_buf),
             ],
         );
-        readback_f32(&self.device, &self.queue, &y_buf, rows * c)
+        let y = pool_readback_f32(&self.pool, &self.device, &self.queue, &y_buf, rows * c);
+        pool_release(&self.pool, vec![x_buf, g_buf, b_buf, y_buf, dims_buf]);
+        y
     }
 
     /// `ops::layernorm_bwd` on the GPU: `(dx (rows,c), dg (c), db (c))`.
@@ -1108,13 +1117,13 @@ impl GpuOps {
             return (Vec::new(), vec![0.0; c], vec![0.0; c]);
         }
         let dims = [rows as u32, c as u32, eps.to_bits(), 0u32];
-        let x_buf = upload_f32(&self.device, &self.queue, x);
-        let gy_buf = upload_f32(&self.device, &self.queue, gy);
-        let g_buf = upload_f32(&self.device, &self.queue, g);
-        let dx_buf = storage_out(&self.device, rows * c);
-        let dgp_buf = storage_out(&self.device, rows * c);
-        let dbp_buf = storage_out(&self.device, rows * c);
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let x_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, x);
+        let gy_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, gy);
+        let g_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, g);
+        let dx_buf = pool_out(&self.pool, &self.device, rows * c);
+        let dgp_buf = pool_out(&self.pool, &self.device, rows * c);
+        let dbp_buf = pool_out(&self.pool, &self.device, rows * c);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
         dispatch(
             &self.device,
             &self.queue,
@@ -1133,9 +1142,9 @@ impl GpuOps {
 
         // dg/db: column-reduce both partials (rows × c → c).
         let rd_dims = [rows as u32, c as u32, 0u32, 0u32];
-        let dg_buf = storage_out(&self.device, c);
-        let db_buf = storage_out(&self.device, c);
-        let rd_buf = upload_uniform_u32(&self.device, &self.queue, &rd_dims);
+        let dg_buf = pool_out(&self.pool, &self.device, c);
+        let db_buf = pool_out(&self.pool, &self.device, c);
+        let rd_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &rd_dims);
         for (p, o) in [(&dgp_buf, &dg_buf), (&dbp_buf, &db_buf)] {
             dispatch(
                 &self.device,
@@ -1145,17 +1154,18 @@ impl GpuOps {
                 &[bind(0, p), bind(1, o), bind(2, &rd_buf)],
             );
         }
-        let dx = readback_f32(&self.device, &self.queue, &dx_buf, rows * c);
-        let dg = readback_f32(&self.device, &self.queue, &dg_buf, c);
-        let db = readback_f32(&self.device, &self.queue, &db_buf, c);
+        let dx = pool_readback_f32(&self.pool, &self.device, &self.queue, &dx_buf, rows * c);
+        let dg = pool_readback_f32(&self.pool, &self.device, &self.queue, &dg_buf, c);
+        let db = pool_readback_f32(&self.pool, &self.device, &self.queue, &db_buf, c);
+        pool_release(&self.pool, vec![x_buf, gy_buf, g_buf, dx_buf, dgp_buf, dbp_buf, dims_buf, dg_buf, db_buf, rd_buf]);
         (dx, dg, db)
     }
 
     /// `ops::gelu_fwd` tanh approximation; returns `y` (the CPU version's
     /// returned saved input stays on the host side here).
     pub fn gelu_fwd(&self, x: &[f32]) -> Vec<f32> {
-        let x_buf = upload_f32(&self.device, &self.queue, x);
-        let y_buf = storage_out(&self.device, x.len());
+        let x_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, x);
+        let y_buf = pool_out(&self.pool, &self.device, x.len());
         dispatch(
             &self.device,
             &self.queue,
@@ -1163,15 +1173,17 @@ impl GpuOps {
             [ceil_div(x.len(), 256) as u32, 1],
             &[bind(0, &x_buf), bind(1, &y_buf)],
         );
-        readback_f32(&self.device, &self.queue, &y_buf, x.len())
+        let y = pool_readback_f32(&self.pool, &self.device, &self.queue, &y_buf, x.len());
+        pool_release(&self.pool, vec![x_buf, y_buf]);
+        y
     }
 
     /// `ops::gelu_bwd` given the saved forward input.
     pub fn gelu_bwd(&self, x: &[f32], dy: &[f32]) -> Vec<f32> {
         assert_eq!(x.len(), dy.len(), "dy shape");
-        let x_buf = upload_f32(&self.device, &self.queue, x);
-        let dy_buf = upload_f32(&self.device, &self.queue, dy);
-        let dx_buf = storage_out(&self.device, x.len());
+        let x_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, x);
+        let dy_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, dy);
+        let dx_buf = pool_out(&self.pool, &self.device, x.len());
         dispatch(
             &self.device,
             &self.queue,
@@ -1179,7 +1191,9 @@ impl GpuOps {
             [ceil_div(x.len(), 256) as u32, 1],
             &[bind(0, &x_buf), bind(1, &dy_buf), bind(2, &dx_buf)],
         );
-        readback_f32(&self.device, &self.queue, &dx_buf, x.len())
+        let dx = pool_readback_f32(&self.pool, &self.device, &self.queue, &dx_buf, x.len());
+        pool_release(&self.pool, vec![x_buf, dy_buf, dx_buf]);
+        dx
     }
 
     /// One AdamW step over a whole tensor: `AdamState::step` semantics.
@@ -1217,14 +1231,11 @@ impl GpuOps {
             eps.to_bits(),
             wd.to_bits(),
         ];
-        let g_buf = upload_f32(&self.device, &self.queue, grads);
-        let p_buf = buffer_f32_duplex(&self.device, n);
-        let m_buf = buffer_f32_duplex(&self.device, n);
-        let v_buf = buffer_f32_duplex(&self.device, n);
-        self.queue.write_buffer(&p_buf, 0, bytemuck_bytes(params));
-        self.queue.write_buffer(&m_buf, 0, bytemuck_bytes(m));
-        self.queue.write_buffer(&v_buf, 0, bytemuck_bytes(v));
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let g_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, grads);
+        let p_buf = pool_duplex_f32(&self.pool, &self.device, &self.queue, params);
+        let m_buf = pool_duplex_f32(&self.pool, &self.device, &self.queue, m);
+        let v_buf = pool_duplex_f32(&self.pool, &self.device, &self.queue, v);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
         dispatch(
             &self.device,
             &self.queue,
@@ -1238,12 +1249,13 @@ impl GpuOps {
                 bind(4, &dims_buf),
             ],
         );
-        let p_out = readback_f32(&self.device, &self.queue, &p_buf, n);
+        let p_out = pool_readback_f32(&self.pool, &self.device, &self.queue, &p_buf, n);
         params.copy_from_slice(&p_out);
-        let m_out = readback_f32(&self.device, &self.queue, &m_buf, n);
+        let m_out = pool_readback_f32(&self.pool, &self.device, &self.queue, &m_buf, n);
         m.copy_from_slice(&m_out);
-        let v_out = readback_f32(&self.device, &self.queue, &v_buf, n);
+        let v_out = pool_readback_f32(&self.pool, &self.device, &self.queue, &v_buf, n);
         v.copy_from_slice(&v_out);
+        pool_release(&self.pool, vec![g_buf, p_buf, m_buf, v_buf, dims_buf]);
     }
 
     /// ‖g‖₂ over one gradient tensor, for grad clipping. GPU computes 64
@@ -1258,9 +1270,9 @@ impl GpuOps {
         let workgroups = 64usize.min(n.div_ceil(256));
         let chunk = n.div_ceil(workgroups); // fits u32 for model-scale tensors (< 2^32 / 256)
         let dims = [n as u32, chunk as u32, 0u32, 0u32];
-        let g_buf = upload_f32(&self.device, &self.queue, grads);
-        let o_buf = storage_out(&self.device, workgroups);
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let g_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, grads);
+        let o_buf = pool_out(&self.pool, &self.device, workgroups);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
         dispatch(
             &self.device,
             &self.queue,
@@ -1268,10 +1280,11 @@ impl GpuOps {
             [workgroups as u32, 1],
             &[bind(0, &g_buf), bind(1, &o_buf), bind(2, &dims_buf)],
         );
-        let partials = readback_f32(&self.device, &self.queue, &o_buf, workgroups);
+        let partials = pool_readback_f32(&self.pool, &self.device, &self.queue, &o_buf, workgroups);
         // Each partial is already a sum of squares; fold plainly (no-repeat
         // the square like the host would with raw values).
         let sq_total: f64 = partials.iter().map(|&p| p as f64).sum();
+        pool_release(&self.pool, vec![g_buf, o_buf, dims_buf]);
         sq_total.sqrt() as f32
     }
 
@@ -1282,9 +1295,8 @@ impl GpuOps {
         }
         let n = grads.len();
         let dims: [u32; 4] = [s.to_bits(), n as u32, 0, 0];
-        let g_buf = buffer_f32_duplex(&self.device, n);
-        self.queue.write_buffer(&g_buf, 0, bytemuck_bytes(grads));
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let g_buf = pool_duplex_f32(&self.pool, &self.device, &self.queue, grads);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
         dispatch(
             &self.device,
             &self.queue,
@@ -1292,8 +1304,9 @@ impl GpuOps {
             [ceil_div(n, 256) as u32, 1],
             &[bind(0, &g_buf), bind(1, &dims_buf)],
         );
-        let g_out = readback_f32(&self.device, &self.queue, &g_buf, n);
+        let g_out = pool_readback_f32(&self.pool, &self.device, &self.queue, &g_buf, n);
         grads.copy_from_slice(&g_out);
+        pool_release(&self.pool, vec![g_buf, dims_buf]);
     }
 
     /// Softmax cross-entropy, `ops::cross_entropy` semantics: returns
@@ -1316,11 +1329,11 @@ impl GpuOps {
         }
         let tgt_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
         let dims = [rows as u32, vocab as u32, 0u32, 0u32];
-        let x_buf = upload_f32(&self.device, &self.queue, logits);
+        let x_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, logits);
         let tgt_buf = upload_u32_storage(&self.device, &self.queue, &tgt_u32);
-        let p_buf = storage_out(&self.device, rows * vocab);
-        let loss_buf = storage_out(&self.device, rows);
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let p_buf = pool_out(&self.pool, &self.device, rows * vocab);
+        let loss_buf = pool_out(&self.pool, &self.device, rows);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
         dispatch(
             &self.device,
             &self.queue,
@@ -1336,7 +1349,7 @@ impl GpuOps {
         );
 
         // dlogits = (p − onehot)/rows via the elementwise bwd kernel.
-        let d_buf = storage_out(&self.device, rows * vocab);
+        let d_buf = pool_out(&self.pool, &self.device, rows * vocab);
         dispatch(
             &self.device,
             &self.queue,
@@ -1345,18 +1358,19 @@ impl GpuOps {
             &[bind(0, &p_buf), bind(1, &tgt_buf), bind(2, &d_buf), bind(3, &dims_buf)],
         );
 
-        let probs = readback_f32(&self.device, &self.queue, &p_buf, rows * vocab);
-        let per_row = readback_f32(&self.device, &self.queue, &loss_buf, rows);
+        let probs = pool_readback_f32(&self.pool, &self.device, &self.queue, &p_buf, rows * vocab);
+        let per_row = pool_readback_f32(&self.pool, &self.device, &self.queue, &loss_buf, rows);
         let loss =
             (per_row.iter().map(|&l| l as f64).sum::<f64>() / rows as f64) as f32;
-        let dlogits = readback_f32(&self.device, &self.queue, &d_buf, rows * vocab);
+        let dlogits = pool_readback_f32(&self.pool, &self.device, &self.queue, &d_buf, rows * vocab);
+        pool_release(&self.pool, vec![x_buf, tgt_buf, p_buf, loss_buf, dims_buf, d_buf]);
         (loss, dlogits, probs)
     }
 
     /// Embedding gather (`modules::Embedding::forward`): row-per-token.
     pub fn embedding_fwd(&self, table: &[f32], ids: &[usize], dim: usize) -> Vec<f32> {
         let rows = ids.len();
-        assert!(table.len() % dim == 0, "table shape");
+        assert!(table.len().is_multiple_of(dim), "table shape");
         for &t in ids {
             assert!(t * dim < table.len(), "id out of vocab");
         }
@@ -1365,10 +1379,10 @@ impl GpuOps {
         }
         let ids_u32: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
         let dims = [(rows * dim) as u32, dim as u32, 0u32, 0u32];
-        let table_buf = upload_f32(&self.device, &self.queue, table);
+        let table_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, table);
         let ids_buf = upload_u32_storage(&self.device, &self.queue, &ids_u32);
-        let out_buf = storage_out(&self.device, rows * dim);
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let out_buf = pool_out(&self.pool, &self.device, rows * dim);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
         dispatch(
             &self.device,
             &self.queue,
@@ -1381,7 +1395,9 @@ impl GpuOps {
                 bind(3, &dims_buf),
             ],
         );
-        readback_f32(&self.device, &self.queue, &out_buf, rows * dim)
+        let out = pool_readback_f32(&self.pool, &self.device, &self.queue, &out_buf, rows * dim);
+        pool_release(&self.pool, vec![table_buf, ids_buf, out_buf, dims_buf]);
+        out
     }
 
     /// Embedding scatter-add backward (`Embedding::backward`): accumulates
@@ -1390,7 +1406,7 @@ impl GpuOps {
     pub fn embedding_bwd(&self, ids: &[usize], dx: &[f32], grads: &mut [f32], dim: usize) {
         let rows = ids.len();
         assert_eq!(dx.len(), rows * dim, "dx shape");
-        assert!(grads.len() % dim == 0, "grads shape");
+        assert!(grads.len().is_multiple_of(dim), "grads shape");
         let vocab = grads.len() / dim;
         for &t in ids {
             assert!(t < vocab, "id out of vocab");
@@ -1400,11 +1416,10 @@ impl GpuOps {
         }
         let ids_u32: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
         let dims = [(vocab * dim) as u32, rows as u32, dim as u32, 0u32];
-        let dx_buf = upload_f32(&self.device, &self.queue, dx);
+        let dx_buf = pool_upload_f32(&self.pool, &self.device, &self.queue, dx);
         let ids_buf = upload_u32_storage(&self.device, &self.queue, &ids_u32);
-        let dt_buf = buffer_f32_duplex(&self.device, vocab * dim);
-        self.queue.write_buffer(&dt_buf, 0, bytemuck_bytes(grads));
-        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        let dt_buf = pool_duplex_f32(&self.pool, &self.device, &self.queue, grads);
+        let dims_buf = pool_uniform_u32(&self.pool, &self.device, &self.queue, &dims);
         dispatch(
             &self.device,
             &self.queue,
@@ -1417,8 +1432,9 @@ impl GpuOps {
                 bind(3, &dims_buf),
             ],
         );
-        let dt_out = readback_f32(&self.device, &self.queue, &dt_buf, vocab * dim);
+        let dt_out = pool_readback_f32(&self.pool, &self.device, &self.queue, &dt_buf, vocab * dim);
         grads.copy_from_slice(&dt_out);
+        pool_release(&self.pool, vec![dx_buf, ids_buf, dt_buf, dims_buf]);
     }
 }
 
@@ -2120,6 +2136,182 @@ fn upload_u32_storage(device: &wgpu::Device, queue: &wgpu::Queue, data: &[u32]) 
     });
     queue.write_buffer(&buf, 0, &bytes);
     buf
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2.7: device-buffer pool. Each host call used to create and destroy
+// 3–6 buffers + a MAP_READ staging buffer, paying allocator + validation
+// cost per op on top of staging copies. The pool recycles buffers keyed by
+// (usage bits, size); staging buffers are pooled separately by size.
+// Safety: every host method drains its queue via the final readback poll
+// before recycling; recycled memory is always fully rewritten (inputs via
+// write_buffer, outputs by the kernel covering every element, duplex by
+// write_buffer). Pools live per GPU-handle struct, never across Devices.
+// ---------------------------------------------------------------------------
+#[derive(Default)]
+struct Pool {
+    free: std::collections::HashMap<(u32, u64), Vec<wgpu::Buffer>>,
+    staging: std::collections::HashMap<u64, wgpu::Buffer>,
+}
+
+impl Pool {
+    fn take(
+        &mut self,
+        device: &wgpu::Device,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        label: &str,
+    ) -> wgpu::Buffer {
+        if let Some(buf) = self.free.get_mut(&(usage.bits(), size)).and_then(Vec::pop) {
+            return buf;
+        }
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn release(&mut self, buf: wgpu::Buffer) {
+        let key = (buf.usage().bits(), buf.size());
+        self.free.entry(key).or_default().push(buf);
+    }
+
+    fn take_staging(&mut self, device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+        if let Some(buf) = self.staging.remove(&size) {
+            return buf;
+        }
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-read"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn release_staging(&mut self, buf: wgpu::Buffer) {
+        self.staging.insert(buf.size(), buf);
+    }
+}
+
+/// Pool-backed helpers, shared by `GpuGemm`/`GpuOps` (each owns one pool +
+/// one device, so buffers never leave their device).
+fn pool_upload_f32(
+    pool: &core::cell::RefCell<Pool>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    data: &[f32],
+) -> wgpu::Buffer {
+    let buf = pool
+        .borrow_mut()
+        .take(device, (data.len() * 4) as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, "gpu-in");
+    queue.write_buffer(&buf, 0, bytemuck_bytes(data));
+    buf
+}
+
+/// Duplex pool buffer: COPY_DST | COPY_SRC (in-place op inputs).
+fn pool_duplex_f32(
+    pool: &core::cell::RefCell<Pool>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    data: &[f32],
+) -> wgpu::Buffer {
+    let buf = pool.borrow_mut().take(
+        device,
+        (data.len() * 4) as u64,
+        wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        "gpu-inout",
+    );
+    queue.write_buffer(&buf, 0, bytemuck_bytes(data));
+    buf
+}
+
+/// Read-only-storage output buffer (kernel writes, host copies out).
+fn pool_out(
+    pool: &core::cell::RefCell<Pool>,
+    device: &wgpu::Device,
+    len_f32: usize,
+) -> wgpu::Buffer {
+    pool.borrow_mut().take(
+        device,
+        (len_f32 * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "gpu-out",
+    )
+}
+
+/// Uniform upload (16-byte aligned).
+fn pool_uniform_u32(
+    pool: &core::cell::RefCell<Pool>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    data: &[u32],
+) -> wgpu::Buffer {
+    let mut bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    while !bytes.len().is_multiple_of(16) {
+        bytes.push(0);
+    }
+    let buf = pool.borrow_mut().take(
+        device,
+        bytes.len() as u64,
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        "gpu-dims",
+    );
+    queue.write_buffer(&buf, 0, &bytes);
+    buf
+}
+
+/// Like `readback_f32` but with a pooled MAP_READ staging buffer.
+fn pool_readback_f32(
+    pool: &core::cell::RefCell<Pool>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src: &wgpu::Buffer,
+    len_f32: usize,
+) -> Vec<f32> {
+    let size = (len_f32 * 4) as u64;
+    let read = pool.borrow_mut().take_staging(device, size);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpu-read-enc"),
+    });
+    encoder.copy_buffer_to_buffer(src, 0, &read, 0, size);
+    queue.submit(Some(encoder.finish()));
+    let slice = read.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res.map_err(|e| e.to_string()));
+    });
+    device
+        .poll(wgpu::PollType::Wait)
+        .map_err(|e| format!("gpu poll failed: {e}"))
+        .unwrap();
+    rx.recv()
+        .map_err(|e| format!("gpu readback channel failed: {e}"))
+        .unwrap()
+        .map_err(|e| format!("gpu map_async failed: {e}"))
+        .unwrap();
+    let out: Vec<f32> = slice
+        .get_mapped_range()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect();
+    read.unmap();
+    pool.borrow_mut().release_staging(read);
+    out
+}
+
+/// Return a batch of pooled buffers after a call's final readback (the
+/// queue drain from `pool_readback_f32` guarantees the buffers are idle).
+fn pool_release(pool: &core::cell::RefCell<Pool>, bufs: Vec<wgpu::Buffer>) {
+    let mut p = pool.borrow_mut();
+    for b in bufs {
+        p.release(b);
+    }
 }
 
 /// Copies a buffer to a MAP_READ staging buffer, waits, and returns the f32

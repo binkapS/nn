@@ -1277,7 +1277,7 @@ fn gpu_embedding_perf() {
     let (iters, warm) = (10usize, 3usize);
 
     let mut emb = Embedding::new(vocab, dim, 0.02, &mut rng);
-    let mut g_cpu = vec![0.0f32; vocab * dim];
+    let g_cpu = vec![0.0f32; vocab * dim];
     let mut g_gpu = g_cpu.clone();
     let bench = |cpu: &mut dyn FnMut(), gpu: &mut dyn FnMut()| {
         for _ in 0..warm {

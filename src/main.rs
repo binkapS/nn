@@ -8,6 +8,7 @@
 mod attention;
 mod corpus;
 mod data;
+mod gpu;
 mod modules;
 mod ops;
 mod rng;
@@ -28,6 +29,7 @@ struct Args {
     /// default). Lets `--data` silently override the default dataset while
     /// still erroring on an explicit `--hf X --data Y` conflict.
     hf_explicit: bool,
+    backend: String,
     steps: usize,
     layers: usize,
     heads: usize,
@@ -51,6 +53,7 @@ fn default_args() -> Args {
         // Default dataset: allenai/c4 (streaming sample, see data.rs).
         hf: Some(data::DEFAULT_HF_ALIAS.to_string()),
         hf_explicit: false,
+        backend: "auto".to_string(),
         steps: 5000,
         layers: 4,
         heads: 4,
@@ -107,6 +110,9 @@ fn parse_args() -> Args {
             "--hf" => {
                 a.hf = Some(next!().to_string());
                 a.hf_explicit = true;
+            }
+            "--backend" => {
+                a.backend = next!().to_string();
             }
             "--steps" => {
                 a.steps = next!()
@@ -205,6 +211,9 @@ TRAINING DATA
   --data <FILE>      Train on a local text file instead (overrides --hf).
 
 MODEL / TRAINING (defaults in parentheses)
+  --backend <s>      Compute engine: cpu | gpu | auto ({})
+                     GPU kernels land in Stage 2 (PLAN.md); until then all
+                     backends train on CPU — auto/gpu still probe hardware.
   --steps <n>        Training steps ({})
   --layers <n>       Transformer blocks ({})
   --heads <n>        Attention heads per block ({})
@@ -243,6 +252,7 @@ executable (cargo run / target/release layouts), and created on demand.
         d.prompt,
         d.print_every,
         d.eval_every,
+        d.backend,
         def_hf = data::DEFAULT_HF_ALIAS,
     )
 }
@@ -255,6 +265,20 @@ fn main() {
         eprintln!("{}", usage());
         std::process::exit(2);
     }
+
+    // Stage 1: resolve the compute engine. GPU kernels are not ported yet
+    // (Stage 2), so `auto`/`gpu` probe the adapter and report; training stays
+    // on CPU until kernels land.
+    let (engine, adapter_note) = match gpu::select_backend(&args.backend, false) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: {e}");
+            eprintln!("{}", usage());
+            std::process::exit(2);
+        }
+    };
+    let _ = engine; // used once GPU kernels land (Stage 2)
+    eprintln!("[engine] {adapter_note}");
 
     // Resolution order: `--hf <alias|URL>` (with graceful local fallback) >
     // `--data FILE` > cached file in data/ > bundled demo corpus.

@@ -544,3 +544,53 @@ fn perf_diag_train_step() {
         "diag train_step: full = {full:.1} ms  (fwd {fwd:.1}, bwd {bwd:.1}, upd {upd:.1}), loss {loss}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stage 1: GPU scaffold
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backend_selection_semantics() {
+    use crate::gpu::{select_backend, Engine};
+
+    // cpu always CPU regardless of hardware.
+    let (e, note) = select_backend("cpu", false).unwrap();
+    assert_eq!(e, Engine::Cpu);
+    assert!(note.contains("cpu engine"));
+
+    // unknown flag errors.
+    assert!(select_backend("metal", false).is_err());
+
+    // In this sandbox gpu/auto with gpu_implemented=false resolve to CPU but
+    // carry the adapter/limitation note. (Adapter presence varies per host,
+    // so only the shape of the outcome is asserted.)
+    for flag in ["auto", "gpu"] {
+        match select_backend(flag, false) {
+            Ok((e, note)) => {
+                assert_eq!(e, Engine::Cpu, "{flag} must fall back before Stage 2");
+                assert!(!note.is_empty(), "{flag} must carry a note: {note}");
+            }
+            Err(err) => {
+                // Only `gpu` may hard-fail without an adapter on the host.
+                assert_eq!(flag, "gpu", "{flag} must not fail in auto mode: {err}");
+                assert!(err.contains("no usable adapter"), "{err}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU/driver; run explicitly: cargo test --release -- --ignored --nocapture gpu_scaffold"]
+fn gpu_scaffold() {
+    // Full scaffold check: probe → device open → passthrough roundtrip.
+    let note = crate::gpu::probe_adapters().expect("adapter");
+    println!("{note}");
+    let dev = crate::gpu::open_device().expect("device");
+    let data: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+    let out = crate::gpu::device_roundtrip(&dev, &data).expect("roundtrip");
+    assert_eq!(out.len(), data.len());
+    for (a, b) in out.iter().zip(&data) {
+        assert_eq!(a, b, "passthrough roundtrip must be a 1:1 copy");
+    }
+    println!("gpu roundtrip OK over {} f32 lanes", data.len());
+}

@@ -93,21 +93,77 @@ fn parse_args() -> Args {
             }
             "--data" => a.data = Some(next!().to_string()),
             "--hf" => a.hf = Some(next!().to_string()),
-            "--steps" => a.steps = next!().parse().unwrap_or_else(|e| invalid(&format!("--steps: {e}"), &usage)),
-            "--layers" => a.layers = next!().parse().unwrap_or_else(|e| invalid(&format!("--layers: {e}"), &usage)),
-            "--heads" => a.heads = next!().parse().unwrap_or_else(|e| invalid(&format!("--heads: {e}"), &usage)),
-            "--embd" => a.embd = next!().parse().unwrap_or_else(|e| invalid(&format!("--embd: {e}"), &usage)),
-            "--block" => a.block = next!().parse().unwrap_or_else(|e| invalid(&format!("--block: {e}"), &usage)),
-            "--batch" => a.batch = next!().parse().unwrap_or_else(|e| invalid(&format!("--batch: {e}"), &usage)),
-            "--lr" => a.lr = next!().parse().unwrap_or_else(|e| invalid(&format!("--lr: {e}"), &usage)),
-            "--wd" => a.wd = next!().parse().unwrap_or_else(|e| invalid(&format!("--wd: {e}"), &usage)),
-            "--temperature" => a.temperature = next!().parse().unwrap_or_else(|e| invalid(&format!("--temperature: {e}"), &usage)),
-            "--top-k" => a.top_k = next!().parse().unwrap_or_else(|e| invalid(&format!("--top-k: {e}"), &usage)),
-            "--max-new" => a.max_new = next!().parse().unwrap_or_else(|e| invalid(&format!("--max-new: {e}"), &usage)),
+            "--steps" => {
+                a.steps = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--steps: {e}"), &usage))
+            }
+            "--layers" => {
+                a.layers = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--layers: {e}"), &usage))
+            }
+            "--heads" => {
+                a.heads = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--heads: {e}"), &usage))
+            }
+            "--embd" => {
+                a.embd = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--embd: {e}"), &usage))
+            }
+            "--block" => {
+                a.block = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--block: {e}"), &usage))
+            }
+            "--batch" => {
+                a.batch = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--batch: {e}"), &usage))
+            }
+            "--lr" => {
+                a.lr = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--lr: {e}"), &usage))
+            }
+            "--wd" => {
+                a.wd = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--wd: {e}"), &usage))
+            }
+            "--temperature" => {
+                a.temperature = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--temperature: {e}"), &usage))
+            }
+            "--top-k" => {
+                a.top_k = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--top-k: {e}"), &usage))
+            }
+            "--max-new" => {
+                a.max_new = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--max-new: {e}"), &usage))
+            }
             "--prompt" => a.prompt = next!().to_string(),
-            "--seed" => a.seed = next!().parse().unwrap_or_else(|e| invalid(&format!("--seed: {e}"), &usage)),
-            "--print-every" => a.print_every = next!().parse().unwrap_or_else(|e| invalid(&format!("--print-every: {e}"), &usage)),
-            "--eval-every" => a.eval_every = next!().parse().unwrap_or_else(|e| invalid(&format!("--eval-every: {e}"), &usage)),
+            "--seed" => {
+                a.seed = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--seed: {e}"), &usage))
+            }
+            "--print-every" => {
+                a.print_every = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--print-every: {e}"), &usage))
+            }
+            "--eval-every" => {
+                a.eval_every = next!()
+                    .parse()
+                    .unwrap_or_else(|e| invalid(&format!("--eval-every: {e}"), &usage))
+            }
             other => invalid(&format!("unknown flag: {other}"), &usage),
         }
         i += 1;
@@ -117,7 +173,11 @@ fn parse_args() -> Args {
 
 fn usage() -> String {
     let d = default_args();
-    let aliases = data::HF_DATASETS.iter().map(|(a, ..)| *a).collect::<Vec<_>>().join(", ");
+    let aliases = data::HF_DATASETS
+        .iter()
+        .map(|(a, ..)| *a)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "tiny GPT — a dependency-free decoder-only Transformer in Rust
 
@@ -152,13 +212,23 @@ SAMPLING / OUTPUT
 The data/ directory is resolved against the CWD first, then relative to the
 executable (cargo run / target/release layouts), and created on demand.
 ",
-        d.steps, d.layers, d.heads, d.embd, d.block, d.batch,
-        d.lr, d.wd, d.seed,
-        d.temperature, d.top_k, d.max_new, d.prompt,
-        d.print_every, d.eval_every,
+        d.steps,
+        d.layers,
+        d.heads,
+        d.embd,
+        d.block,
+        d.batch,
+        d.lr,
+        d.wd,
+        d.seed,
+        d.temperature,
+        d.top_k,
+        d.max_new,
+        d.prompt,
+        d.print_every,
+        d.eval_every,
     )
 }
-
 
 fn main() {
     let mut args = parse_args();
@@ -235,9 +305,7 @@ fn main() {
             last_report = Instant::now();
             let tps = nchars as f32 / elapsed.max(f32::EPSILON);
             nchars = 0;
-            print!(
-                "{:>4}      {:>12.4}/", step, loss
-            );
+            print!("{:>4}      {:>12.4}/", step, loss);
             if args.eval_every > 0 && (step % args.eval_every == 0 || step == args.steps - 1) {
                 let (vi, vt) = get_batch(&mut rng, &val_ids, cfg.block_size, args.batch);
                 let vl = model.eval_loss(&vi, &vt);
@@ -280,9 +348,18 @@ fn main() {
         if prompt_ids.is_empty() {
             continue;
         }
-        let seq = model.generate(&prompt_ids, args.max_new, args.temperature, args.top_k, &mut rng);
+        let seq = model.generate(
+            &prompt_ids,
+            args.max_new,
+            args.temperature,
+            args.top_k,
+            &mut rng,
+        );
         println!();
-        println!("―― sample, prompt = {prompt:?} (temp = {}, top-k = {}) ――", args.temperature, args.top_k);
+        println!(
+            "―― sample, prompt = {prompt:?} (temp = {}, top-k = {}) ――",
+            args.temperature, args.top_k
+        );
         println!("{}", tokenizer.decode(&seq));
     }
 }

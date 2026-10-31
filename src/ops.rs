@@ -15,7 +15,9 @@ use std::thread;
 const PAR_THRESHOLD: usize = 16;
 
 fn thread_count() -> usize {
-    thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Split `n` units of work into balanced `(lo, hi)` ranges, one per thread.
@@ -103,7 +105,14 @@ where
 // ---------------------------------------------------------------------------
 
 /// `y (M,N) = x (M,K) @ wt (K,N) + bias(N)`
-pub fn matmul_fwd(x: &[f32], wt: &[f32], bias: Option<&[f32]>, m: usize, k: usize, n: usize) -> Vec<f32> {
+pub fn matmul_fwd(
+    x: &[f32],
+    wt: &[f32],
+    bias: Option<&[f32]>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
     assert_eq!(x.len(), m * k, "x shape");
     assert_eq!(wt.len(), k * n, "wt shape");
     if let Some(b) = bias {
@@ -136,7 +145,14 @@ pub fn matmul_fwd(x: &[f32], wt: &[f32], bias: Option<&[f32]>, m: usize, k: usiz
 
 /// Backward through `y = x @ wt`: returns `(dx (M,K), dwt (K,N))` with
 /// `dx = gy @ wtᵀ` and `dwt += xᵀ @ gy`.
-pub fn matmul_bwd(x: &[f32], wt: &[f32], gy: &[f32], m: usize, k: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
+pub fn matmul_bwd(
+    x: &[f32],
+    wt: &[f32],
+    gy: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (Vec<f32>, Vec<f32>) {
     assert_eq!(gy.len(), m * n, "gy shape");
     let mut dx = vec![0.0f32; m * k];
     par_rows(&mut dx, m, k, &|dxr, (lo, _hi)| {
@@ -195,7 +211,14 @@ pub fn layernorm_fwd(x: &[f32], g: &[f32], b: &[f32], rows: usize, c: usize, eps
 }
 
 /// Backward of the above. Returns `(dx (rows,c), dg (c), db (c))`.
-pub fn layernorm_bwd(x: &[f32], gy: &[f32], g: &[f32], rows: usize, c: usize, eps: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+pub fn layernorm_bwd(
+    x: &[f32],
+    gy: &[f32],
+    g: &[f32],
+    rows: usize,
+    c: usize,
+    eps: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     assert_eq!(x.len(), rows * c);
     assert_eq!(gy.len(), rows * c);
     let mut dx = vec![0.0f32; rows * c];
@@ -243,7 +266,14 @@ pub fn layernorm_bwd(x: &[f32], gy: &[f32], g: &[f32], rows: usize, c: usize, ep
 
 /// Worker for `layernorm_bwd`: computes dx for the given row range plus
 /// partial dg/db reductions. Returns `(dx_snippet, (dg_partial, db_partial))`.
-fn layernorm_rows(x: &[f32], gy: &[f32], g: &[f32], rows: (usize, usize), c: usize, eps: f32) -> (Vec<f32>, (Vec<f32>, Vec<f32>)) {
+fn layernorm_rows(
+    x: &[f32],
+    gy: &[f32],
+    g: &[f32],
+    rows: (usize, usize),
+    c: usize,
+    eps: f32,
+) -> (Vec<f32>, (Vec<f32>, Vec<f32>)) {
     let (lo, hi) = rows;
     let n_rows = hi - lo;
     let mut dx = vec![0.0f32; n_rows * c];
@@ -358,7 +388,12 @@ pub fn softmax_bwd(p: &[f32], gy: &[f32], rows: usize, cols: usize) -> Vec<f32> 
 
 /// Softmax cross-entropy over `(rows, vocab)` logits with integer targets.
 /// Returns `(mean_loss, dlogits (rows,vocab), probs (rows,vocab))`.
-pub fn cross_entropy(logits: &[f32], targets: &[usize], rows: usize, vocab: usize) -> (f32, Vec<f32>, Vec<f32>) {
+pub fn cross_entropy(
+    logits: &[f32],
+    targets: &[usize],
+    rows: usize,
+    vocab: usize,
+) -> (f32, Vec<f32>, Vec<f32>) {
     assert_eq!(logits.len(), rows * vocab, "logits shape");
     assert_eq!(targets.len(), rows, "targets shape");
     let (p, _saved) = softmax_fwd(logits, rows, vocab);

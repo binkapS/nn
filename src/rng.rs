@@ -12,7 +12,10 @@ pub struct Rng {
 impl Rng {
     pub fn new(seed: u64) -> Self {
         // Avoid the all-zero state, which is a fixed point for xorshift.
-        Self { s: seed.max(1), spare: None }
+        Self {
+            s: seed.max(1),
+            spare: None,
+        }
     }
 
     pub fn next_u64(&mut self) -> u64 {

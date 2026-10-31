@@ -112,7 +112,14 @@ impl Linear {
 
     pub fn forward(&mut self, x: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
         self.cached_x = x.to_vec();
-        matmul_fwd(x, &self.w.params, Some(&self.b.params), rows, in_dim, out_dim)
+        matmul_fwd(
+            x,
+            &self.w.params,
+            Some(&self.b.params),
+            rows,
+            in_dim,
+            out_dim,
+        )
     }
 
     pub fn backward(&mut self, dy: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {

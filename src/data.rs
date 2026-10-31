@@ -39,7 +39,11 @@ pub fn default_data_dir() -> PathBuf {
         .chain(exe_dir.iter().flat_map(|d| {
             [
                 d.join("data"),
-                d.join("..").join("..").join("data").components().collect::<PathBuf>(),
+                d.join("..")
+                    .join("..")
+                    .join("data")
+                    .components()
+                    .collect::<PathBuf>(),
             ]
         }))
         .collect();
@@ -65,7 +69,11 @@ fn integrity_path(local: &Path) -> PathBuf {
 
 /// Reads a cache file only if its integrity marker validates it.
 fn load_cached_text(local: &Path) -> Option<String> {
-    let expected: usize = fs::read_to_string(integrity_path(local)).ok()?.trim().parse().ok()?;
+    let expected: usize = fs::read_to_string(integrity_path(local))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     let text = fs::read_to_string(local).ok()?;
     let text = de_bom(text);
     if text.len() == expected && !text.trim().is_empty() {
@@ -108,9 +116,15 @@ pub fn load_text(path: &Option<String>) -> (String, String) {
         let label = std::fs::canonicalize(&cached)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| cached.display().to_string());
-        return (text, format!("{label} (HuggingFace: SamPIngram/tinyshakespeare)"));
+        return (
+            text,
+            format!("{label} (HuggingFace: SamPIngram/tinyshakespeare)"),
+        );
     }
-    (crate::corpus::DEMO_TEXT.to_string(), "built-in demo corpus (offline fallback)".to_string())
+    (
+        crate::corpus::DEMO_TEXT.to_string(),
+        "built-in demo corpus (offline fallback)".to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +138,10 @@ type Source = (String, String);
 /// `https://.../resolve/main/...` URL (saved as `hf_<deterministic-hash>.txt`).
 fn parse_hf_source(source: &str) -> Result<Source, String> {
     if source.starts_with("http://") || source.starts_with("https://") {
-        Ok((format!("hf_{}.txt", direct_url_slug(source)), source.to_string()))
+        Ok((
+            format!("hf_{}.txt", direct_url_slug(source)),
+            source.to_string(),
+        ))
     } else {
         HF_DATASETS
             .iter()
@@ -165,11 +182,17 @@ pub fn fetch_hf_into(dir: &Path, source: &str) -> Result<(String, String), Strin
     let text = fs::read_to_string(&local)
         .map_err(|e| format!("downloaded file unreadable ({}): {e}", local.display()))?;
     if text.trim().is_empty() {
-        return Err(format!("download from {url} is empty — is the URL correct?"));
+        return Err(format!(
+            "download from {url} is empty — is the URL correct?"
+        ));
     }
     let text = de_bom(text);
     write_cache(&local, &text)?;
-    eprintln!("[hf] saved → {} ({} bytes) [integrity marker written]", local.display(), text.len());
+    eprintln!(
+        "[hf] saved → {} ({} bytes) [integrity marker written]",
+        local.display(),
+        text.len()
+    );
     Ok((text, local.display().to_string()))
 }
 
@@ -184,7 +207,9 @@ fn download_to(local: &Path, url: &str) -> Result<(), String> {
         .arg(local)
         .arg(url)
         .output()
-        .map_err(|e| format!("failed to run curl (is it installed?) — or point --data at a local file: {e}"))?;
+        .map_err(|e| {
+            format!("failed to run curl (is it installed?) — or point --data at a local file: {e}")
+        })?;
     if !output.status.success() {
         return Err(format!(
             "curl exited {} for {url} — dataset unreachable or URL wrong (stderr: {})",
@@ -255,7 +280,9 @@ pub fn sample_prompts(text: &str, user: &str) -> Vec<String> {
     let mut counts: HashMap<String, (u32, usize)> = HashMap::new();
     let mut first_seen = 0usize;
     for w in text.split_whitespace() {
-        let w = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        let w = w
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
         if w.chars().count() < 2 {
             first_seen += 1;
             continue;
@@ -268,9 +295,7 @@ pub fn sample_prompts(text: &str, user: &str) -> Vec<String> {
         counts.into_iter().map(|(w, (c, f))| (w, c, f)).collect();
     // frequency desc, first-appearance asc, then alphabetical *only* when
     // both are equal to keep the result deterministic.
-    words.sort_unstable_by(|a, b| {
-        b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0))
-    });
+    words.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
     let mut prompts: Vec<String> = words
         .into_iter()
         .take(3)
@@ -298,7 +323,12 @@ impl CharTokenizer {
         let mut buf: Vec<char> = text.chars().collect();
         buf.sort();
         buf.dedup();
-        let stoi = buf.iter().cloned().enumerate().map(|(i, c)| (c, i)).collect();
+        let stoi = buf
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, c)| (c, i))
+            .collect();
         Self { chars: buf, stoi }
     }
 
@@ -308,7 +338,9 @@ impl CharTokenizer {
 
     /// Encodes, silently dropping characters outside the vocabulary.
     pub fn encode(&self, s: &str) -> Vec<usize> {
-        s.chars().filter_map(|c| self.stoi.get(&c).copied()).collect()
+        s.chars()
+            .filter_map(|c| self.stoi.get(&c).copied())
+            .collect()
     }
 
     pub fn decode(&self, ids: &[usize]) -> String {
@@ -327,8 +359,16 @@ pub fn split(text: &str, train_frac: f64) -> (String, String) {
 /// Draws one batch of `(inputs, targets)` of shape (`batch`, `block_size`)
 /// by sampling random windows. A target at position t is the token at t+1.
 /// Inputs and targets are returned flattened (rows = batch * block_size).
-pub fn get_batch(rng: &mut Rng, data: &[usize], block_size: usize, batch: usize) -> (Vec<usize>, Vec<usize>) {
-    assert!(data.len() > block_size + 1, "dataset too small for block_size");
+pub fn get_batch(
+    rng: &mut Rng,
+    data: &[usize],
+    block_size: usize,
+    batch: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    assert!(
+        data.len() > block_size + 1,
+        "dataset too small for block_size"
+    );
     let n = data.len() - block_size - 1;
     let mut inputs = Vec::with_capacity(batch * block_size);
     let mut targets = Vec::with_capacity(batch * block_size);
@@ -351,27 +391,37 @@ mod tests {
     #[test]
     fn hf_alias_urls() {
         assert_eq!(HF_DATASETS[0].0, "shakespeare");
-        assert!(HF_DATASETS[0]
-            .2
-            .starts_with("https://huggingface.co/datasets/SamPIngram/tinyshakespeare/resolve/main/"));
+        assert!(HF_DATASETS[0].2.starts_with(
+            "https://huggingface.co/datasets/SamPIngram/tinyshakespeare/resolve/main/"
+        ));
     }
 
     #[test]
     fn direct_url_slug_works() {
-        let url = "https://huggingface.co/datasets/SamPIngram/tinyshakespeare/resolve/main/input.txt";
+        let url =
+            "https://huggingface.co/datasets/SamPIngram/tinyshakespeare/resolve/main/input.txt";
         let slug = direct_url_slug(url);
         // deterministic: prefix is the sanitized parsed path, suffix is the
         // 8-hex FNV-1a of the full URL.
         assert_eq!(slug.split('-').count(), 2, "{slug}");
-        assert!(slug.starts_with("huggingface.co_datasets_SamPIngram_tinyshakespeare"), "{slug}");
+        assert!(
+            slug.starts_with("huggingface.co_datasets_SamPIngram_tinyshakespeare"),
+            "{slug}"
+        );
         assert!(slug.contains("input.txt-"), "{slug}");
         // hash suffix: dash + exactly 8 hex digits
         let tail = &slug[slug.len() - 9..];
         assert_eq!(&tail[..1], "-");
         assert!(tail[1..].chars().all(|c| c.is_ascii_hexdigit()), "{tail}");
         // different URLs never collide (hash differs)
-        assert_ne!(direct_url_slug("https://x.com/a.txt"), direct_url_slug("https://x.com/b.txt"));
-        assert_eq!(direct_url_slug("https://x.com/a.txt"), direct_url_slug("https://x.com/a.txt"));
+        assert_ne!(
+            direct_url_slug("https://x.com/a.txt"),
+            direct_url_slug("https://x.com/b.txt")
+        );
+        assert_eq!(
+            direct_url_slug("https://x.com/a.txt"),
+            direct_url_slug("https://x.com/a.txt")
+        );
     }
 
     #[test]
@@ -393,7 +443,10 @@ mod tests {
 
     #[test]
     fn sample_prompts_falls_back() {
-        assert_eq!(sample_prompts("", "x "), vec!["x ".to_string(), "the ".to_string()]);
+        assert_eq!(
+            sample_prompts("", "x "),
+            vec!["x ".to_string(), "the ".to_string()]
+        );
     }
 
     #[test]

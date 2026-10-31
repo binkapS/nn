@@ -5,7 +5,9 @@ use crate::attention::Attention;
 use crate::corpus::DEMO_TEXT;
 use crate::data::{CharTokenizer, get_batch};
 use crate::modules::Embedding;
-use crate::ops::{cross_entropy, gelu_bwd, gelu_fwd, layernorm_bwd, layernorm_fwd, matmul_bwd, matmul_fwd};
+use crate::ops::{
+    cross_entropy, gelu_bwd, gelu_fwd, layernorm_bwd, layernorm_fwd, matmul_bwd, matmul_fwd,
+};
 use crate::rng::Rng;
 use crate::transformer::Config;
 
@@ -208,13 +210,22 @@ fn schedule_edges() {
     for (total, warmup) in [(0usize, 0usize), (0, 5), (3, 5), (1, 1), (100, 0)] {
         for step in 0..(total.max(warmup) + 5) {
             let lr = sched(step, total, warmup);
-            assert!(lr.is_finite(), "step {step} total {total} warmup {warmup} → {lr}");
-            assert!((1.4e-4..=1.51e-3).contains(&lr), "lr {lr} out of band, step {step}/{total}/{warmup}");
+            assert!(
+                lr.is_finite(),
+                "step {step} total {total} warmup {warmup} → {lr}"
+            );
+            assert!(
+                (1.4e-4..=1.51e-3).contains(&lr),
+                "lr {lr} out of band, step {step}/{total}/{warmup}"
+            );
         }
     }
     // Sanity: full run reaches min_lr at the final step, peak at warmup end.
     let (total, warmup, peak, min) = (200usize, 10usize, 1.5e-3_f32, 1.5e-4_f32);
-    assert_eq!(crate::schedule(0, total, warmup, peak, min), peak * 1.0 / warmup as f32);
+    assert_eq!(
+        crate::schedule(0, total, warmup, peak, min),
+        peak * 1.0 / warmup as f32
+    );
     assert!((crate::schedule(total - 1, total, warmup, peak, min) - min).abs() < 1e-6);
 }
 

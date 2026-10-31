@@ -34,7 +34,11 @@ pub struct Attention {
 
 impl Attention {
     pub fn new(n_head: usize, embed_dim: usize, rng: &mut Rng) -> Self {
-        assert_eq!(embed_dim % n_head, 0, "embed_dim must split evenly among heads");
+        assert_eq!(
+            embed_dim % n_head,
+            0,
+            "embed_dim must split evenly among heads"
+        );
         Self {
             n_head,
             d_head: embed_dim / n_head,
@@ -142,14 +146,19 @@ impl Attention {
                 let (q, k, v) = (&self.q[bhh], &self.k[bhh], &self.v[bhh]);
 
                 // Head slice of row i of dconcat:
-                let out = |i: usize| &dconcat[(bi * t + i) * c + h * d..(bi * t + i) * c + (h + 1) * d];
+                let out =
+                    |i: usize| &dconcat[(bi * t + i) * c + h * d..(bi * t + i) * c + (h + 1) * d];
 
                 // dp_{t,s} = (dout_t . v_s)
                 let mut dp = vec![0.0f32; t * t];
                 for i in 0..t {
                     let oi = out(i);
                     for s in 0..=i {
-                        dp[i * t + s] = oi.iter().zip(&v[s * d..(s + 1) * d]).map(|(&ov, &vv)| ov * vv).sum();
+                        dp[i * t + s] = oi
+                            .iter()
+                            .zip(&v[s * d..(s + 1) * d])
+                            .map(|(&ov, &vv)| ov * vv)
+                            .sum();
                     }
                 }
 

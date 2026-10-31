@@ -183,9 +183,9 @@ pub struct Gpt {
     head: Linear, // C -> V (untied from the embedding table)
 
     // Saved for backward:
-    ids: Vec<usize>,   // (B*T) token ids of last forward
-    emb: Vec<f32>,     // token+position embeddings (B*T, C)
-    logits: Vec<f32>,  // (B*T, V) from last forward
+    ids: Vec<usize>,  // (B*T) token ids of last forward
+    emb: Vec<f32>,    // token+position embeddings (B*T, C)
+    logits: Vec<f32>, // (B*T, V) from last forward
     b: usize,
     t: usize,
 }
@@ -217,7 +217,11 @@ impl Gpt {
     pub fn forward(&mut self, ids: &[usize]) -> Vec<f32> {
         let cfg = self.cfg;
         let t = cfg.block_size;
-        assert_eq!(ids.len() % t, 0, "input length must be a multiple of block_size");
+        assert_eq!(
+            ids.len() % t,
+            0,
+            "input length must be a multiple of block_size"
+        );
         let b = ids.len() / t;
         let rows = b * t;
         let c = cfg.n_embd;
@@ -251,7 +255,9 @@ impl Gpt {
         let rows = self.b * self.t;
         let (loss, dlogits, _p) = cross_entropy(&self.logits, targets, rows, cfg.vocab_size);
 
-        let dhf = self.head.backward(&dlogits, rows, cfg.n_embd, cfg.vocab_size);
+        let dhf = self
+            .head
+            .backward(&dlogits, rows, cfg.n_embd, cfg.vocab_size);
         let mut dh = self.ln_f.backward(&dhf, rows, cfg.n_embd, LN_EPS);
 
         for block in self.blocks.iter_mut().rev() {
@@ -290,7 +296,8 @@ impl Gpt {
     }
 
     pub fn total_grad_sq(&self) -> f64 {
-        let mut s = self.tok_emb.sq_sum() + self.pos_emb.sq_sum() + self.ln_f.sq_sum() + self.head.sq_sum();
+        let mut s =
+            self.tok_emb.sq_sum() + self.pos_emb.sq_sum() + self.ln_f.sq_sum() + self.head.sq_sum();
         for block in &self.blocks {
             s += block.sq_sum();
         }
@@ -329,7 +336,14 @@ impl Gpt {
 
     /// One full training step: forward, CE loss + backward, global-norm
     /// gradient clipping, AdamW update. Returns the batch loss.
-    pub fn train_step(&mut self, ids: &[usize], targets: &[usize], lr: f32, wd: f32, clip: f32) -> f32 {
+    pub fn train_step(
+        &mut self,
+        ids: &[usize],
+        targets: &[usize],
+        lr: f32,
+        wd: f32,
+        clip: f32,
+    ) -> f32 {
         self.zero_grad();
         self.forward(ids);
         let loss = self.backward_from_targets(targets);
@@ -348,7 +362,14 @@ impl Gpt {
     /// Autoregressive sampling: grows `prompt` by `n_new` tokens, feeding only
     /// the last `block_size` tokens each step. Temperature 0 = greedy,
     /// top_k = 0 disables top-k. Returns the full sequence.
-    pub fn generate(&mut self, prompt: &[usize], n_new: usize, temperature: f32, top_k: usize, rng: &mut Rng) -> Vec<usize> {
+    pub fn generate(
+        &mut self,
+        prompt: &[usize],
+        n_new: usize,
+        temperature: f32,
+        top_k: usize,
+        rng: &mut Rng,
+    ) -> Vec<usize> {
         assert!(!prompt.is_empty(), "prompt must contain at least one token");
         let mut seq = prompt.to_vec();
         for _ in 0..n_new {

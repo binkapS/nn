@@ -23,6 +23,7 @@ use transformer::{Config, Gpt};
 
 struct Args {
     data: Option<String>,
+    hf: Option<String>,
     steps: usize,
     layers: usize,
     heads: usize,
@@ -43,7 +44,8 @@ struct Args {
 fn default_args() -> Args {
     Args {
         data: None,
-        steps: 600,
+        hf: None,
+        steps: 2000,
         layers: 3,
         heads: 3,
         embd: 96,
@@ -80,6 +82,7 @@ fn parse_args() -> Args {
         }
         match flag {
             "--data" => a.data = Some(next!().to_string()),
+            "--hf" => a.hf = Some(next!().to_string()),
             "--steps" => a.steps = next!().parse().unwrap(),
             "--layers" => a.layers = next!().parse().unwrap(),
             "--heads" => a.heads = next!().parse().unwrap(),
@@ -103,9 +106,26 @@ fn parse_args() -> Args {
 }
 
 fn main() {
-    let args = parse_args();
+    let mut args = parse_args();
 
-    let text = load_text(&args.data);
+    // Resolution order: `--hf <alias|URL>` > `--data FILE` > cached file in
+    // data/ > bundled demo corpus.
+    let (text, source_label) = match &args.hf {
+        Some(hf) => data::fetch_hf(hf),
+        None => {
+            let text = load_text(&args.data);
+            let label = args.data.clone().unwrap_or_else(|| {
+                if std::path::Path::new("data/tiny_shakespeare.txt").exists() {
+                    "data/tiny_shakespeare.txt (HuggingFace: SamPIngram/tinyshakespeare)".to_string()
+                } else {
+                    "built-in demo corpus (offline fallback)".to_string()
+                }
+            });
+            (text, label)
+        }
+    };
+    args.data = Some(source_label.clone());
+
     let tokenizer = CharTokenizer::build(&text);
     let (train_text, val_text) = split(&text, 0.9);
     let train_ids = tokenizer.encode(&train_text);
@@ -125,6 +145,7 @@ fn main() {
     println!("―――――――――――――――――――――――――――――――――――――――――――――――");
     println!("tiny GPT · decoder-only Transformer · pure Rust");
     println!("―――――――――――――――――――――――――――――――――――――――――――――――");
+    println!("dataset       : {source_label}");
     println!("vocabulary    : {} chars", cfg.vocab_size);
     println!("train tokens  : {}", train_ids.len());
     println!("val tokens    : {}", val_ids.len());
@@ -193,8 +214,12 @@ fn main() {
         before.elapsed().as_secs_f32()
     );
 
-    // Sampling showcase from a few fixed prompts.
-    for prompt in [args.prompt.as_str(), "tom ", "the river "] {
+    // Sampling showcase from a few prompts (the user's own + dataset-friendly
+    // fixed ones). Deduped in case the user picked the same prompt.
+    let mut prompts: Vec<String> = vec![args.prompt.clone(), "we ".to_string(), "our ".to_string()];
+    prompts.sort();
+    prompts.dedup();
+    for prompt in &prompts {
         let prompt_ids = tokenizer.encode(prompt);
         if prompt_ids.is_empty() {
             continue;

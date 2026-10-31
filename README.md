@@ -3,7 +3,8 @@
 A complete, **working** neural network built on the Transformer design,
 implemented from scratch with **zero dependencies**. Every component —
 tokenization, embeddings, attention, all backward passes, AdamW — is
-hand-written in this crate.
+hand-written in this crate. It trains on text pulled straight from a
+**Hugging Face dataset** (default: the classic *TinyShakespeare*).
 
 ## What it is
 
@@ -27,24 +28,34 @@ against central finite differences** by the test suite (`cargo test`).
 ## Usage
 
 ```bash
-cargo run --release                      # train on the built-in demo corpus
+cargo run --release                      # train on Hugging Face TinyShakespeare
 cargo test  --release                    # run gradient checks + training smoke test
 ```
 
-Train on your own text and tune hyperparameters:
+Datasets are resolved in this order:
+
+1. `--hf <alias|URL>` — fetch a Hugging Face dataset (see table below) and
+   cache it in `data/`; subsequent runs reuse the cache offline.
+2. `--data FILE` — train on any local text file.
+3. Otherwise: the cached `data/tiny_shakespeare.txt` if present, else the
+   tiny bundled demo corpus (fully offline fallback).
+
+Train on your own dataset and tune hyperparameters:
 
 ```bash
 cargo run --release -- \
-  --data mybook.txt \
-  --steps 2000 --layers 4 --heads 4 --embd 128 --block 128 \
-  --batch 16 --lr 1e-3 --wd 0.1 \
-  --temperature 0.8 --top-k 16 --prompt "once upon a "
+  --hf shakespeare \
+  --steps 2000 --layers 3 --heads 3 --embd 96 --block 64 \
+  --batch 8 --lr 1.5e-3 --wd 0.1 \
+  --temperature 0.8 --top-k 12 \
+  --prompt "to be "
 ```
 
 | Flag             | Default   | Meaning                                    |
 |------------------|-----------|--------------------------------------------|
-| `--data`         | demo text | Text file to train on                       |
-| `--steps`        | 600       | Training steps                              |
+| `--hf`           | none      | HF dataset alias (`shakespeare`) or direct `https://…/resolve/main/…` URL, cached in `data/` |
+| `--data`         | cached/defaulted | Local text file to train on instead |
+| `--steps`        | 2000      | Training steps                              |
 | `--layers`       | 3         | Transformer blocks                          |
 | `--heads`        | 3         | Attention heads per block                   |
 | `--embd`         | 96        | Model dimension `d_model`                   |
@@ -60,23 +71,53 @@ cargo run --release -- \
 | `--print-every`  | 20        | Progress interval                           |
 | `--eval-every`   | 100       | Validation-loss interval                    |
 
+## Available HF datasets
+
+| Alias          | HF dataset                       | Contents                          |
+|----------------|----------------------------------|-----------------------------------|
+| `shakespeare`  | `SamPIngram/tinyshakespeare`     | 1.1 MB · canon tiny-shakespeare char-LM corpus (40 k lines of Shakespeare) |
+
+Any direct HF resolve URL works too, e.g.:
+
+```bash
+cargo run --release -- --hf "https://huggingface.co/datasets/<user>/<repo>/resolve/main/<file>.txt"
+```
+
+Downloads are cached under `data/` (git-ignored), require `curl` on the PATH,
+and fall back to the bundled corpus when unavailable.
+
 ## Example run
 
 ```
-vocabulary    : 32 chars          parameters : 346 688
+dataset       : data/tiny_shakespeare.txt (HuggingFace: SamPIngram/tinyshakespeare)
+vocabulary    : 65 chars          parameters : 353 057
 architecture  : 3 layers, 3 heads, d_model = 96, ctx = 64
 step      loss (train/val)
-   0            3.4564/3.4295
- 300            1.8005/2.2555
- 599            1.5100/2.3335
-―― sample, prompt = "the river " (temp = 0.8) ――
-the river wach wheresh as arur
-ane thealed gale the the tolm lomeroned ...
+   0            4.2131/4.2036
+1000            2.2782/2.1450
+1999            1.9266/1.9896
+final: train 1.9361 · val 2.0648 · perplexity ≈ 7.88 · total time 595.4s
+
+―― sample, prompt = "the " (temp = 0.8, top-k = 12) ――
+the of
+Orias ming the thour the in tis whull is thains.
+Thou not ay tromer, thy, but men the chell the aspit
+Anding ase oof die of but it be hom.
+
+LEOS:
+Sty, mart you forn sour thel bleass
+The pare with maged his and the shhouldy wert the cring wome,
+...
 ```
 
-(The bundled corpus is only ~3.2k characters, so the model learns its style
-quickly and starts overfitting; point `--data` at a real book for better
-results. As a rule of thumb, char-level models want ≥100k characters.)
+The model learns the *shape* of Shakespeare — speaker labels (`LEOS:`),
+`thou/thee/thy/hath`, verse-and-blank structure, punctuation — within the
+default 2000 steps (~10 min on a 4-core laptop). For cleaner text, raise
+`--steps 5000`, `--block 128`, `--embd 128`, `--batch 16` (proportionally
+more time; the default footprint deliberately fits a laptop CPU).
+
+For reference: the bundled 3.2 k-character demo corpus (offline fallback)
+converges in a few hundred steps by design.
 
 ## Implementation notes
 
@@ -108,7 +149,7 @@ results. As a rule of thumb, char-level models want ≥100k characters.)
 | `src/attention.rs`    | causal multi-head self-attention + backward     |
 | `src/transformer.rs`  | Transformer block, GPT model, training step, sampling |
 | `src/data.rs`         | char tokenizer, train/val split, batch sampler  |
-| `src/corpus.rs`       | built-in demo corpus                            |
-| `src/rng.rs`          | xorshift64* PRNG + Box–Muller normal sampler    |
-| `src/main.rs`         | CLI, training loop, schedule, evaluation, generation |
+| `src/corpus.rs`       | built-in offline fallback demo corpus            |
+| `src/rng.rs`          | xorshift64* PRNG + Box–Muller normal sampler     |
+| `src/main.rs`         | CLI, HF/`--data` loading, training loop, schedule, eval, generation |
 | `src/tests.rs`        | finite-difference gradient checks + smoke test  |

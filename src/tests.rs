@@ -412,7 +412,7 @@ fn perf_diag_bwd_halves() {
     let t = 4usize;
 
     // dx half: dx[r][kk] = dot(gy[r], wt[kk])
-    let mut dx_t = 10_000.0f64;
+    let dx_t: f64;
     {
         let wt: &[f32] = &wt;
         let gy: &[f32] = &gy;
@@ -421,7 +421,7 @@ fn perf_diag_bwd_halves() {
             let mut dx = vec![0.0f32; m * k];
             std::thread::scope(|s| {
                 let mut rest: &mut [f32] = &mut dx;
-                for i in 0..t {
+                for _ in 0..t {
                     let len = (m / t) * k;
                     let (chunk, tail) = rest.split_at_mut(len);
                     rest = tail;
@@ -446,7 +446,7 @@ fn perf_diag_bwd_halves() {
     }
 
     // dwt half: per-thread accumulate over row ranges (current design)
-    let mut dwt_t = 10_000.0f64;
+    let dwt_t: f64;
     {
         let x: &[f32] = &x;
         let gy: &[f32] = &gy;
@@ -604,7 +604,7 @@ fn rel_err_max(a: &[f32], b: &[f32]) -> f64 {
     assert_eq!(a.len(), b.len(), "shape mismatch in parity compare");
     a.iter()
         .zip(b)
-        .map(|(&x, &y)| ((x - y) as f64 / (x.abs().max(y.abs()) as f64).max(1e-8).max(1.0)))
+        .map(|(&x, &y)| (x - y) as f64 / (x.abs().max(y.abs()) as f64).max(1e-8).max(1.0))
         .fold(0.0f64, f64::max)
 }
 
@@ -794,7 +794,7 @@ fn gpu_elementwise_parity() {
         let x: Vec<f32> = (0..n)
             .map(|i| match i % 4 {
                 0 => rng.normal(0.0, 3.0),
-                1 => -(rng.normal(0.0, 10.0).abs() as f32),
+                1 => -(rng.normal(0.0, 10.0).abs()),
                 2 => rng.normal(0.0, 1.0),
                 _ => rng.normal(0.0, 5.0),
             })

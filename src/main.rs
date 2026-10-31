@@ -410,7 +410,9 @@ fn schedule(_step: usize, total: usize, warmup: usize, peak: f32, min_lr: f32) -
     if _step < warmup {
         peak * (_step + 1) as f32 / warmup.max(1) as f32
     } else {
-        let p = (_step - warmup) as f32 / (total - warmup).max(1) as f32;
+        let num = _step.saturating_sub(warmup);
+        let denom = total.saturating_sub(warmup).max(1);
+        let p = num as f32 / denom as f32;
         let p = p.min(1.0);
         min_lr + 0.5 * (peak - min_lr) * (1.0 + (std::f32::consts::PI * p).cos())
     }

@@ -230,7 +230,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 use std::borrow::Cow;
 
 /// `bytemuck`-free little-endian byte view of f32 data (stdin of the GPU).
-fn bytemuck_bytes(data: &[f32]) -> &[u8] {
+pub(crate) fn bytemuck_bytes(data: &[f32]) -> &[u8] {
     // SAFETY: &[f32] is plain old data; a flat byte reinterpretation of the
     // same slice is always valid (alignment of u8 < f32).
     unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) }
@@ -248,7 +248,7 @@ fn bytemuck_bytes(data: &[f32]) -> &[u8] {
 /// chunk (no early return: the `k` bound is uniform so the loop exit is
 /// uniform too). Out-of-range loads are clamped in-bounds and their
 /// contribution is zeroed via `select` — never a raw OOB access.
-const GEMM_FWD_WGSL: &str = r#"
+pub(crate) const GEMM_FWD_WGSL: &str = r#"
 struct Dims {
     rows: u32,    // m
     inner: u32,   // k
@@ -321,7 +321,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 /// 16-lane column of `x` and `gy` in workgroup memory per chunk. Each output
 /// cell is written exactly once (accumulated locally first), so the output
 /// buffer needs no pre-zeroing.
-const GEMM_DWT_WGSL: &str = r#"
+pub(crate) const GEMM_DWT_WGSL: &str = r#"
 struct Dims {
     rows: u32,    // m
     inner: u32,   // k
@@ -506,7 +506,7 @@ impl GpuGemm {
 /// normalizes. The `var = max(Σx²/n − mean², 0)` clamp guards against a
 /// negative variance from f32 cancellation (the CPU form Σ(x−m)² can't go
 /// negative; mathematically identical).
-const LN_FWD_WGSL: &str = r#"
+pub(crate) const LN_FWD_WGSL: &str = r#"
 struct LnDims {
     rows: u32,
     cols: u32,   // c
@@ -567,7 +567,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 /// scalars via the shared tree, writes the whole `dx` row, and leaves
 /// per-row `dg`/`db` contributions in a (rows × c) partial buffer that a
 /// follow-up column-reduce kernel sums (f32 atomics are not in WebGPU).
-const LN_BWD_WGSL: &str = r#"
+pub(crate) const LN_BWD_WGSL: &str = r#"
 struct LnDims {
     rows: u32,
     cols: u32,   // c
@@ -655,7 +655,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
 /// Column reduction over a (w × c) partial buffer: `out[col] = Σ_r p[r·c + col]`.
 /// One thread per column, no barriers needed; used to finish LN dg/db.
-const REDUCE_COLS_WGSL: &str = r#"
+pub(crate) const REDUCE_COLS_WGSL: &str = r#"
 struct RdDims {
     w: u32,    // rows of partials (= rows of LN input)
     c: u32,
@@ -684,7 +684,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// GeLU forward (tanh approximation, same constants as `ops::gelu_fwd`):
 /// `y = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
-const GELU_FWD_WGSL: &str = r#"
+pub(crate) const GELU_FWD_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read> x_buf: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y_buf: array<f32>;
 
@@ -701,7 +701,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 /// GeLU backward given the saved forward input x: elementwise.
-const GELU_BWD_WGSL: &str = r#"
+pub(crate) const GELU_BWD_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read> x_buf: array<f32>;
 @group(0) @binding(1) var<storage, read> dy_buf: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dx_buf: array<f32>;
@@ -725,7 +725,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// `m = b1·m + (1−b1)·g; v = b2·v + (1−b2)·g²; θ −= lr·(m̂/(√v̂+ε) + wd·θ)`.
 /// The bias corrections `bc1/bc2` are computed on the host from the step
 /// counter (`powf` is not in WGSL core).
-const ADAMW_WGSL: &str = r#"
+pub(crate) const ADAMW_WGSL: &str = r#"
 struct AdamDims {
     n: u32,
     lr: f32,
@@ -763,7 +763,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// barrier finishes the block, and `o_buf[wid]` holds one f32 partial.
 /// (The final f64 fold over the 32–64 partials happens host-side, mirroring
 /// the CPU's f64 gradient-norm accumulation.)
-const SQNORM_WGSL: &str = r#"
+pub(crate) const SQNORM_WGSL: &str = r#"
 struct SqDims {
     n: u32,
     chunk: u32,   // elements per workgroup
@@ -803,7 +803,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
 /// Elementwise gradient scale ("multiply all grads by s") used by grad
 /// clipping; a no-op skip for `s == 1.0` is a host-side decision.
-const GRAD_SCALE_WGSL: &str = r#"
+pub(crate) const GRAD_SCALE_WGSL: &str = r#"
 struct ScaleDims {
     s: f32,
     n: u32,
@@ -828,7 +828,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// numerically stable row softmax, writes `probs`, and emits the per-row
 /// loss `-ln(max p[target], EPS)` into a per-row buffer (the host folds
 /// the mean in f64, mirroring the CPU accumulation).
-const CE_FWD_WGSL: &str = r#"
+pub(crate) const CE_FWD_WGSL: &str = r#"
 struct CeDims {
     rows: u32,
     vocab: u32,
@@ -907,7 +907,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
 /// Softmax-CE backward, elementwise over (rows × vocab):
 /// `dlogits = (p − onehot(target)) / rows`.
-const CE_BWD_WGSL: &str = r#"
+pub(crate) const CE_BWD_WGSL: &str = r#"
 struct CeDims {
     rows: u32,
     vocab: u32,
@@ -942,7 +942,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Embedding forward: gather `emb_fwd(ids) -> out` with
 /// `out[r·dim + j] = table[ids[r]·dim + j]`, thread-per-element. Ids come
 /// in as a u32 storage buffer.
-const EMB_FWD_WGSL: &str = r#"
+pub(crate) const EMB_FWD_WGSL: &str = r#"
 struct EmbDims {
     n: u32,    // n = rows*dim
     dim: u32,
@@ -974,7 +974,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// scatter-add exactly (no atomics involved). O(vocab·dim·rows) reads of
 /// dx but pass 1 of the loop is a dollar-and-nothing op once the update
 /// runs per token column; vocab at model scale is small (char-level).
-const EMB_BWD_WGSL: &str = r#"
+pub(crate) const EMB_BWD_WGSL: &str = r#"
 struct EmbDims {
     n: u32,     // n = vocab*dim (table length)
     rows: u32,
@@ -1447,7 +1447,7 @@ impl GpuOps {
 /// Split the fused QKV projection (B·T, 3C) into per-head buffers
 /// q/k/v, laid out flat over the (batch, head) pairs:
 /// `buf[(bi·nh + h)·T·d + tt·d + j]`. Thread-per-element over b·nh·T·d.
-const SPLIT_QKV_WGSL: &str = r#"
+pub(crate) const SPLIT_QKV_WGSL: &str = r#"
 struct AttnDims {
     b: u32,     // batch
     t: u32,     // sequence length T
@@ -1498,7 +1498,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// pT (upper triangle stays zero for the backward GEMMs), and the output
 /// row `concat[i, h·d..]` accumulates `p[i,s]·v[s]` (first term written
 /// `=` like the CPU, so no prezero of concat is needed).
-const ATTN_FWD_WGSL: &str = r#"
+pub(crate) const ATTN_FWD_WGSL: &str = r#"
 struct AttnDims {
     b: u32,     // batch
     t: u32,     // sequence length T
@@ -1575,7 +1575,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 "#;
 
 /// Split `dconcat` (B·T, C) into per-head rows matching q/k/v layout.
-const SPLIT_DH_WGSL: &str = r#"
+pub(crate) const SPLIT_DH_WGSL: &str = r#"
 struct AttnDims {
     b: u32,     // batch
     t: u32,     // sequence length T
@@ -1617,7 +1617,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// `dot = Σ_s dp·p`,  `ds[i,s] = p[i,s]·(dp − dot)·scale` written to both the
 /// row-major ds buffer and its transpose (readers see the s > i tail as the
 /// prezeroed zeros the math needs).
-const ATTN_BWD_DS_WGSL: &str = r#"
+pub(crate) const ATTN_BWD_DS_WGSL: &str = r#"
 struct AttnDims {
     b: u32,     // batch
     t: u32,     // sequence length T
@@ -1676,7 +1676,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 /// `y (m,n) = x (m,k) @ w (k,n)` with fixed m=T k=T n=d and batch strides
 /// m·k / k·n / m·n. Thread-per-element over nb·m·n (tiny tiles, T·T·d work
 /// each — no tiling needed at this size).
-const BATCHED_GEMM_WGSL: &str = r#"
+pub(crate) const BATCHED_GEMM_WGSL: &str = r#"
 struct BgDims {
     nb: u32,
     m: u32,
@@ -1712,7 +1712,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// Scatter dq/dk/dv (per-head layout) back into the fused QKV gradient
 /// (B·T, 3C). Head column ranges are exclusive, so plain writes are safe.
-const SCATTER_DQKV_WGSL: &str = r#"
+pub(crate) const SCATTER_DQKV_WGSL: &str = r#"
 struct AttnDims {
     b: u32,     // batch
     t: u32,     // sequence length T
@@ -2018,7 +2018,7 @@ impl GpuAttention {
 }
 
 /// Read-only-storage-size output buffer (kernel writes, host copies out).
-fn storage_out(device: &wgpu::Device, len_f32: usize) -> wgpu::Buffer {
+pub(crate) fn storage_out(device: &wgpu::Device, len_f32: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gpu-out"),
         size: (len_f32 * 4) as u64,
@@ -2041,7 +2041,7 @@ fn buffer_f32_duplex(device: &wgpu::Device, len_f32: usize) -> wgpu::Buffer {
 }
 
 /// One compute pass: bind group + dispatch. Readback is a separate step.
-fn dispatch(
+pub(crate) fn dispatch(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipeline: &wgpu::ComputePipeline,
@@ -2069,7 +2069,7 @@ fn dispatch(
     queue.submit(Some(encoder.finish()));
 }
 
-fn pipeline(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ComputePipeline {
+pub(crate) fn pipeline(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(wgsl)),
@@ -2084,12 +2084,12 @@ fn pipeline(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ComputePipe
     })
 }
 
-fn ceil_div(a: usize, b: usize) -> usize {
+pub(crate) fn ceil_div(a: usize, b: usize) -> usize {
     a.div_ceil(b)
 }
 
 /// GL-style bind entry for an entire buffer.
-fn bind(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn bind(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buf.as_entire_binding(),
@@ -2097,7 +2097,7 @@ fn bind(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 }
 
 /// Uploads f32 data into a read-only storage buffer.
-fn upload_f32(device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) -> wgpu::Buffer {
+pub(crate) fn upload_f32(device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) -> wgpu::Buffer {
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gemm-in"),
         size: (data.len() * 4) as u64,
@@ -2126,7 +2126,7 @@ fn upload_uniform_u32(device: &wgpu::Device, queue: &wgpu::Queue, data: &[u32]) 
 }
 
 /// Uploads u32 data into a read-only storage buffer (token targets, ids).
-fn upload_u32_storage(device: &wgpu::Device, queue: &wgpu::Queue, data: &[u32]) -> wgpu::Buffer {
+pub(crate) fn upload_u32_storage(device: &wgpu::Device, queue: &wgpu::Queue, data: &[u32]) -> wgpu::Buffer {
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gpu-u32-in"),
@@ -2149,7 +2149,7 @@ fn upload_u32_storage(device: &wgpu::Device, queue: &wgpu::Queue, data: &[u32]) 
 // write_buffer). Pools live per GPU-handle struct, never across Devices.
 // ---------------------------------------------------------------------------
 #[derive(Default)]
-struct Pool {
+pub(crate) struct Pool {
     free: std::collections::HashMap<(u32, u64), Vec<wgpu::Buffer>>,
     staging: std::collections::HashMap<u64, wgpu::Buffer>,
 }
@@ -2197,7 +2197,7 @@ impl Pool {
 
 /// Pool-backed helpers, shared by `GpuGemm`/`GpuOps` (each owns one pool +
 /// one device, so buffers never leave their device).
-fn pool_upload_f32(
+pub(crate) fn pool_upload_f32(
     pool: &core::cell::RefCell<Pool>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2211,7 +2211,7 @@ fn pool_upload_f32(
 }
 
 /// Duplex pool buffer: COPY_DST | COPY_SRC (in-place op inputs).
-fn pool_duplex_f32(
+pub(crate) fn pool_duplex_f32(
     pool: &core::cell::RefCell<Pool>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2230,7 +2230,7 @@ fn pool_duplex_f32(
 }
 
 /// Read-only-storage output buffer (kernel writes, host copies out).
-fn pool_out(
+pub(crate) fn pool_out(
     pool: &core::cell::RefCell<Pool>,
     device: &wgpu::Device,
     len_f32: usize,
@@ -2244,7 +2244,7 @@ fn pool_out(
 }
 
 /// Uniform upload (16-byte aligned).
-fn pool_uniform_u32(
+pub(crate) fn pool_uniform_u32(
     pool: &core::cell::RefCell<Pool>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2265,7 +2265,7 @@ fn pool_uniform_u32(
 }
 
 /// Like `readback_f32` but with a pooled MAP_READ staging buffer.
-fn pool_readback_f32(
+pub(crate) fn pool_readback_f32(
     pool: &core::cell::RefCell<Pool>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2307,7 +2307,7 @@ fn pool_readback_f32(
 
 /// Return a batch of pooled buffers after a call's final readback (the
 /// queue drain from `pool_readback_f32` guarantees the buffers are idle).
-fn pool_release(pool: &core::cell::RefCell<Pool>, bufs: Vec<wgpu::Buffer>) {
+pub(crate) fn pool_release(pool: &core::cell::RefCell<Pool>, bufs: Vec<wgpu::Buffer>) {
     let mut p = pool.borrow_mut();
     for b in bufs {
         p.release(b);
@@ -2316,7 +2316,7 @@ fn pool_release(pool: &core::cell::RefCell<Pool>, bufs: Vec<wgpu::Buffer>) {
 
 /// Copies a buffer to a MAP_READ staging buffer, waits, and returns the f32
 /// contents. Requires `src` to carry `COPY_SRC`.
-fn readback_f32(
+pub(crate) fn readback_f32(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     src: &wgpu::Buffer,

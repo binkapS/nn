@@ -718,7 +718,7 @@ mod tests {
         let mut calls = vec![];
         let text = fetch_c4_with(600, 10, |off| {
             calls.push(off);
-            Ok(if off == 0 { page.clone() } else { page.clone() })
+            Ok(page.clone())
         })
         .unwrap();
         assert!(text.len() >= 500 && text.len() <= 604, "len={}", text.len());

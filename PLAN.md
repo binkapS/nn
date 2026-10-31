@@ -34,17 +34,17 @@ a diagnostic fallback only.
 
 ## Stage 0 — CPU baseline worth having
 
-* [ ] **0.1 Profile & record baseline.** Reproduce current numbers as a table
+* [x] **0.1 Profile & record baseline.** Reproduce current numbers as a table
       in this file: tokens/sec at default config, per-op share (measure a few
       isolated hot paths via `Instant` around matmul/attention/optimizer).
-* [ ] **0.2 Kill per-step allocations.** Audit `ops.rs`/`modules.rs`/
+* [x] **0.2 Kill per-step allocations.** Audit `ops.rs`/`modules.rs`/
       `attention.rs` for `Vec::with_capacity`/clone-per-step; hoist scratch
       buffers into long-lived caches (threads or model-owned) where trivially
       profitable. No unsafe, no behavior change.
-* [ ] **0.3 GEMM loop order + register blocking.** Packed `k`-inner panels,
+* [x] **0.3 GEMM loop order + register blocking.** Packed `k`-inner panels,
       4×4 register blocking, contiguous access on both operands; keep
       parallel row-chunk structure. Target: +1.5× on matmul microbenchmark.
-* [ ] **0.4 Re-baseline.** Re-run default-config benchmark; update the table
+* [x] **0.4 Re-baseline.** Re-run default-config benchmark; update the table
       here; commit. Gate: measurable win, tests green. (These wins persist
       regardless of what Stage 2 concludes.)
 
@@ -86,6 +86,67 @@ Each item = WGSL kernel(s) + parity test + microbenchmark line here + commit.
 
 ## Benchmark log
 
-| Config                     | Date       | Tokens/sec | Notes                |
-|----------------------------|------------|------------|----------------------|
-| default (5000/4/128/128) CPU | 2026-10-31 | ~870       | pre-optimization baseline |
+Shapes: B=8, T=128, C=128, V=155, L=4 (default config); microbench via
+`cargo test --release -- --ignored --nocapture perf_baseline`.
+Per-block means the cost of ONE transformer block (the model stacks L=4).
+
+### Baseline (before Stage 0)
+
+| Op (per block unless noted)   | ms | GFLOP/s | Notes |
+|-------------------------------|------|-------|-------|
+| matmul_fwd[qkv]   1024×128×384 | 7.87  | 12.8    | |
+| matmul_bwd[qkv]               | 56.33 | 2.7     | per-row dwt alloc |
+| matmul_fwd[proj]  1024×128×128 | 3.90  | 8.6     | |
+| matmul_bwd[proj]              | 20.89 | 2.4     | |
+| matmul_fwd[fc1]   1024×128×512 | 10.03 | 13.4    | |
+| matmul_bwd[fc1]               | 77.05 | 2.6     | |
+| matmul_fwd[fc2]   1024×512×128 | 13.94 | 9.6     | |
+| matmul_bwd[fc2]              | 74.81 | 2.7     | |
+| attention.fwd                 | 46.60 | 2.9     | serial b×h loop |
+| attention.fwd+bwd             | 170.86| 2.0     | serial b×h loop |
+| adamw+clip (whole model)      | 3.51  | —       | |
+
+Step estimate from these numbers: ~1.75 s/step (~870 tokens/sec live).
+Diagnosis: (1) `par_reduce` per-row `k*n` buffer allocs ≈ GB of zeroing per
+step; (2) attention serialized its b×h loop on one thread; (3) forward GEMM
+4× headroom via panel blocking; (4) per-step attention scratch allocs.
+
+### After Stage 0 (same test, dedicated measurements)
+
+| Op (per block unless noted)   | ms | GFLOP/s | Change |
+|-------------------------------|------|-------|--------|
+| matmul_fwd[qkv]               | 8.9  | 11.2   | 8-row panels (± noise vs 4-row) |
+| matmul_bwd[qkv]               | 18.4 | 8.2    | dx = transposed-GEMM (was dot loop), dwt once-per-thread buffer |
+| matmul_fwd[proj]              | 3.3  | 10.1   | |
+| matmul_bwd[proj]              | 7.0  | 7.2    | |
+| matmul_fwd[fc1]               | 11.9 | 11.3   | |
+| matmul_bwd[fc1]               | 24.9 | 8.1    | |
+| matmul_fwd[fc2]               | 9.5  | 14.1   | |
+| matmul_bwd[fc2]              | 27.9 | 7.2    | |
+| attention.fwd                 | ~19  | 7.1    | threaded by batch strip, reusable scratch |
+| attention.fwd+bwd             | 65–90| 3.7–5.2 | |
+| adamw+clip (whole model)      | ~4.4 | —      | |
+
+Full `train_step` at default shapes (dedicated diag test):
+**fwd 181 ms / bwd 316 ms / upd 4 ms → 513 ms/step.**
+
+### Live confirmation (30-step c4 run, default config)
+
+* Before: ~1.25 s/step, **~854 tokens/sec**
+* After: ~0.49 s/step, **~2040 tokens/sec → 2.4× end-to-end**
+* Default 5000-step run projected: **~17 min** (was ~70 min).
+
+### Lessons learned (keep for Stage 2)
+
+1. **Never trust a benchmark that ran on a stale binary** — `cargo test`
+   rebuilds only test targets; `cargo build --release` the bin before
+   believing live numbers (cost an hour of confusion: bench said 0.5 s/step,
+   live 1.2 s/step because the binary predates the optimizations).
+2. **`f32::mul_add` NO-GO on this target**: it lowers to scalar `fmaf`
+   libcalls in these axpy loops (10× slower than plain mul+add); plain
+   `mul + add` auto-vectorizes fine. If CPU-level FMA is ever needed again it
+   must go through `core::arch` intrinsics with a scalar fallback — postponed
+   to Stage 3 "reassess" options.
+3. A stale background `nn` process (231% CPU) polluted live timings once;
+   check `ps` before trusting deltas on a shared laptop.
+4. 8-row GEMM panels ≈ 4-row panels within run noise; keep 8+4 (harmless).

@@ -230,6 +230,138 @@ fn schedule_edges() {
 }
 
 #[test]
+#[ignore = "performance report, run explicitly: cargo test --release -- --ignored --nocapture perf_baseline"]
+fn perf_baseline() {
+    // Times each hot op AT THE DEFAULT CONFIG SHAPES (B=8, T=128, C=128,
+    // V=155, L=4) so optimization wins can be attributed to real workload
+    // cost rather than microbenchmark artifacts.
+    fn r2(rng: &mut Rng, n: usize) -> Vec<f32> {
+        (0..n).map(|_| rng.normal(0.0, 1.0)).collect()
+    }
+    fn time(
+        report: &mut Vec<(String, f64, f64)>,
+        name: &str,
+        flops: f64,
+        iters: usize,
+        mut f: impl FnMut(),
+    ) {
+        for _ in 0..iters {
+            f();
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            f();
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        report.push((
+            name.to_string(),
+            ms,
+            if flops > 0.0 { flops / (ms * 1e6) } else { 0.0 },
+        ));
+    }
+
+    let iters = 10;
+    let (m, t, c, v, h, l) = (8 * 128, 128, 128, 155, 4, 4);
+    let mut rng = Rng::new(0xBAD_5EED);
+
+    let mut report: Vec<(String, f64, f64)> = Vec::new(); // (name, ms, GFLOP/s)
+    macro_rules! time {
+        ($name:expr, $flops:expr, $f:expr $(,)?) => {
+            time(&mut report, &$name, $flops, iters, $f)
+        };
+    }
+
+    // -- GEMMs at the four distinct (k, n) shapes of a block + head ---------
+    for &(k, n, tag) in [(c, 3 * c, "qkv"), (c, c, "proj"), (c, 4 * c, "fc1"), (4 * c, c, "fc2")]
+        .iter()
+    {
+        let x = r2(&mut rng, m * k);
+        let wt = r2(&mut rng, k * n);
+        let bias = r2(&mut rng, n);
+        let gy = r2(&mut rng, m * n);
+        let flops = 2.0 * (m * k * n) as f64;
+
+        time!(&format!("matmul_fwd[{tag}] {m}×{k}×{n}"), flops, Box::new(|| {
+            let _ = matmul_fwd(&x, &wt, Some(&bias), m, k, n);
+        }));
+        time!(
+            &format!("matmul_bwd[{tag}] dx|dwt {m}×{k}×{n}"),
+            3.0_f64 * flops / 2.0,
+            Box::new(|| {
+                let _ = matmul_bwd(&x, &wt, &gy, m, k, n);
+            }),
+        );
+    }
+
+    // -- attention (whole layer) --------------------------------------------
+    let xattn = r2(&mut rng, m * c);
+    let mut attn = crate::attention::Attention::new(h, c, &mut rng);
+    let dy = r2(&mut rng, m * c);
+    let attn_flops = 4.0 * (t * t * (c / h)) as f64 + 2.0 * (m * c * 3 * c) as f64 + 2.0 * (m * c * c) as f64;
+    time!("attention.fwd", attn_flops, Box::new(|| {
+        let _ = attn.forward(&xattn, 8, t, c);
+    }));
+    time!("attention.fwd+bwd", 2.5 * attn_flops, Box::new(|| {
+        let _ = attn.forward(&xattn, 8, t, c);
+        let _ = attn.backward(&dy, 8, t, c);
+    }));
+
+    // -- elementwise small fry -----------------------------------------------
+    let xln = r2(&mut rng, m * c);
+    let gln = r2(&mut rng, c);
+    let bln = r2(&mut rng, c);
+    let gyl = r2(&mut rng, m * c);
+    time!("layernorm.fwd(1024,128)", 3.0 * (m * c) as f64, Box::new(|| {
+        let _ = layernorm_fwd(&xln, &gln, &bln, m, c, 1e-5);
+    }));
+    time!(
+        "layernorm.bwd(1024,128)",
+        6.0 * (m * c) as f64,
+        Box::new(|| {
+            let _ = layernorm_bwd(&xln, &gyl, &gln, m, c, 1e-5);
+        }),
+    );
+    let logits = r2(&mut rng, m * v);
+    let targets: Vec<usize> = (0..m).map(|_| rng.rand_index(v)).collect();
+    time!("cross_entropy(1024,155)", 4.0 * (m * v) as f64, Box::new(|| {
+        let _ = cross_entropy(&logits, &targets, m, v);
+    }));
+
+    // -- optimizer + clip (parameter-count scale) -----------------------------
+    let mut gpt = crate::transformer::Gpt::new(
+        crate::transformer::Config {
+            n_layer: l,
+            n_head: h,
+            n_embd: c,
+            block_size: t,
+            vocab_size: v,
+        },
+        &mut rng,
+    );
+    gpt.zero_grad();
+    let _ = gpt.param_count();
+    time!(
+        "adamw+clip on whole Gpt (~847k params)",
+        0.0,
+        Box::new(move || {
+            gpt.clip_grad_norm(1.0);
+            gpt.adam_step(1e-3, 0.1);
+        }),
+    );
+
+    println!("\n── perf baseline (default shapes: B=8 T=128 C=128 V=155, {} iters) ──", iters);
+    println!("{:<44}>{:>10}{:>12}", "op", "ms", "GFLOP/s");
+    for (name, ms, gfl) in &report {
+        if *gfl > 0.0 {
+            println!("{:<44} {:>10.2} {:>12.2}", name, ms, gfl);
+        } else {
+            println!("{:<44} {:>10.2} {:>12}", name, ms, "—");
+        }
+    }
+    println!();
+}
+
+#[test]
 fn training_reduces_loss() {
     // Full-model smoke test: loss must drop meaningfully within a few dozen
     // steps on a slice of the demo corpus.
@@ -265,4 +397,150 @@ fn training_reduces_loss() {
     // Gradients must have flowed (non-zero, finite).
     let sq = model.total_grad_sq();
     assert!(sq.is_finite() && sq > 0.0, "grads invalid: {sq}");
+}
+
+#[test]
+#[ignore = "diag: split matmul_bwd halves"]
+fn perf_diag_bwd_halves() {
+    let (m, k, n) = (1024usize, 128usize, 384usize);
+    let mut rng = Rng::new(7);
+    let mut rr = |len: usize| (0..len).map(|_| rng.normal(0.0, 1.0)).collect::<Vec<f32>>();
+    let x = rr(m * k);
+    let wt = rr(k * n);
+    let gy = rr(m * n);
+    let iters = 10;
+    let t = 4usize;
+
+    // dx half: dx[r][kk] = dot(gy[r], wt[kk])
+    let mut dx_t = 10_000.0f64;
+    {
+        let wt: &[f32] = &wt;
+        let gy: &[f32] = &gy;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut dx = vec![0.0f32; m * k];
+            std::thread::scope(|s| {
+                let mut rest: &mut [f32] = &mut dx;
+                for i in 0..t {
+                    let len = (m / t) * k;
+                    let (chunk, tail) = rest.split_at_mut(len);
+                    rest = tail;
+                    let (wt, gy) = (wt, gy);
+                    s.spawn(move || {
+                        for row in 0..(m / t) {
+                            let gr = &gy[(row) * n..(row + 1) * n];
+                            for kk in 0..k {
+                                chunk[row * k + kk] = gr
+                                    .iter()
+                                    .zip(&wt[kk * n..(kk + 1) * n])
+                                    .map(|(&g, &w)| g * w)
+                                    .sum();
+                            }
+                        }
+                    });
+                }
+            });
+            std::hint::black_box(&dx);
+        }
+        dx_t = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    }
+
+    // dwt half: per-thread accumulate over row ranges (current design)
+    let mut dwt_t = 10_000.0f64;
+    {
+        let x: &[f32] = &x;
+        let gy: &[f32] = &gy;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut dwt = vec![0.0f32; k * n];
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..t)
+                    .map(|i| {
+                        let lo = i * (m / t);
+                        let hi = (i + 1) * (m / t);
+                        let (x, gy) = (x, gy);
+                        s.spawn(move || {
+                            let mut buf = vec![0.0f32; k * n];
+                            for row in lo..hi {
+                                let xr = &x[row * k..(row + 1) * k];
+                                let gr = &gy[row * n..(row + 1) * n];
+                                for (kk, &a) in xr.iter().enumerate() {
+                                    for (dv, &g) in buf[kk * n..(kk + 1) * n].iter_mut().zip(gr) {
+                                        *dv += a * g;
+                                    }
+                                }
+                            }
+                            buf
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    for (o, v) in dwt.iter_mut().zip(h.join().unwrap()) {
+                        *o += v;
+                    }
+                }
+            });
+            std::hint::black_box(&dwt);
+        }
+        dwt_t = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    }
+
+    let fl = 2.0 * (m * k * n) as f64 / 1e9; // GFLOP of one half
+    println!(
+        "diag bwd halves [{m}×{k}×{n}]: dx = {dx_t:.2} ms ({:.1} GF/s)  dwt = {dwt_t:.2} ms ({:.1} GF/s)",
+        fl / (dx_t / 1000.0),
+        fl / (dwt_t / 1000.0),
+    );
+}
+
+#[test]
+#[ignore = "diag: full train_step at default shapes"]
+fn perf_diag_train_step() {
+    use crate::transformer::{Config, Gpt};
+    use std::time::Instant;
+    let cfg = Config {
+        n_layer: 4,
+        n_head: 4,
+        n_embd: 128,
+        block_size: 128,
+        vocab_size: 155,
+    };
+    let mut rng = Rng::new(9);
+    let mut model = Gpt::new(cfg, &mut rng);
+    let rids: Vec<usize> = (0..1024).map(|_| rng.rand_index(155)).collect();
+    let tids: Vec<usize> = (0..1024).map(|_| rng.rand_index(155)).collect();
+    let iters = 5;
+
+    let t0 = Instant::now();
+    let mut loss = 0.0f32;
+    for _ in 0..iters {
+        loss = model.train_step(&rids, &tids, 1e-3, 0.1, 1.0);
+    }
+    let full = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    // forward only
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        std::hint::black_box(model.forward(&rids));
+    }
+    let fwd = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    // backward only (uses last forward's logits)
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        std::hint::black_box(model.backward_from_targets(&tids));
+    }
+    let bwd = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    // updates
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        model.clip_grad_norm(1.0);
+        model.adam_step(1e-3, 0.1);
+    }
+    let upd = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    println!(
+        "diag train_step: full = {full:.1} ms  (fwd {fwd:.1}, bwd {bwd:.1}, upd {upd:.1}), loss {loss}",
+    );
 }

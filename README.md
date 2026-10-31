@@ -35,8 +35,9 @@ cargo test  --release                    # run gradient checks + training smoke 
 ```
 
 The default configuration (5000 steps, 4 layers, d_model 128, context 128)
-trains for roughly **1.5–2 h on a 4-core laptop CPU**. For a quick smoke run
-(as in the example below), pass `--steps 500 --layers 3 --embd 96 --block 64`.
+trains in roughly **35–45 min on a 4-core laptop CPU** (~2000 tokens/sec;
+the pre-optimization engine managed ~870). For a quick smoke run (as in the
+example below), pass `--steps 500 --layers 3 --embd 96 --block 64`.
 
 Datasets are resolved in this order:
 
@@ -134,7 +135,8 @@ batch         : 8 x 128 tokens
 ```
 
 (The exact block above shows the default `cargo run --release` configuration:
-5000 steps ≈ 1.5–2 h on a 4-core laptop, at ~825 tokens/sec)
+5000 steps ≈ 35–45 min on a 4-core laptop, at ~2040 tokens/sec after the
+Stage-0 optimizations — see PLAN.md)
 
 A Shakespeare run under the smaller vintage defaults looks like this:
 

@@ -273,6 +273,37 @@ readbacks (probs + dlogits) + one (rows,) loss dominate; residency (2.7)
 turns this into a striped on-device pass.
 
 
+### Stage 2.6 — embedding gather/scatter GPU kernels
+
+Parity vs CPU `Embedding` (gather + scatter-add into a NONZERO prefilled
+grads table, heavy duplicate-token id streams):
+
+| check  | shapes (rows,vocab,dim)        | max rel err |
+|--------|--------------------------------|-------------|
+| emb.fwd| 1024,155,128 / 17,33,7 / 1,128,64 / 256,1000,32 | 0 (bit-exact) |
+| emb.bwd| same                            | 0 (bit-exact) |
+
+
+* `emb_fwd`: thread-per-element gather `out[r·dim+j] = table[ids[r]·dim+j]`
+  (ids as a u32 storage buffer).
+* `emb_bwd`: thread per (id, column) serially adds `dx[r,j]` for every row
+  with `ids[r]==id` **in place, in r-order** — the same association as the
+  CPU's row-ordered `+=`. My first version summed the tokens first and then
+  added the old table value: different rounding association, and the parity
+  test caught a 2.5e-6 drift (sum of several hundred dups, 1–2 ulp).]);
+
+Bit-exactness beats cleverness: one extra read-modify-write per hit and
+the two engines agree to the last bit, which makes any later fused
+embedding path trivial to verify.
+
+Lesson #10: when matching an in-place accumulate, mirror its ORDER, not
+just its math (`dt += dx_r` per hit instead of `dt + Σdx`).
+
+Perf (1024×155×128 fwd+bwd): CPU 0.09 ms vs GPU 12.3 ms — CPU is
+bandwidth-bound and unbeatable on tiny tables until the table is resident
+(then fwd is a gather kernel and bwd an in-place kernel with zero host
+traffic).
+
 ### Stage 2.5 — causal attention GPU kernels
 
 Parity (vs CPU `attention::Attention` composed with `ops::matmul` on both

@@ -930,6 +930,77 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// Stage 2.6: embedding gather/scatter kernels.
+// ---------------------------------------------------------------------------
+
+/// Embedding forward: gather `emb_fwd(ids) -> out` with
+/// `out[r·dim + j] = table[ids[r]·dim + j]`, thread-per-element. Ids come
+/// in as a u32 storage buffer.
+const EMB_FWD_WGSL: &str = r#"
+struct EmbDims {
+    n: u32,    // n = rows*dim
+    dim: u32,
+    pad0: u32,
+    pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> table_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> ids_buf: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out_buf: array<f32>;
+@group(0) @binding(3) var<uniform> dims: EmbDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= dims.n) {
+        return;
+    }
+    let dim = dims.dim;
+    let r = i / dim;
+    let j = i - r * dim;
+    out_buf[i] = table_buf[ids_buf[r] * dim + j];
+}
+"#;
+
+/// Embedding backward, thread per (id, column): the whole masked sum
+/// `dtable[id,j] = old + Σ_r (ids[r]==id)·dx[r,j]` — one thread serially
+/// scans the rows in r-order, so accumulation order matches the CPU's
+/// scatter-add exactly (no atomics involved). O(vocab·dim·rows) reads of
+/// dx but pass 1 of the loop is a dollar-and-nothing op once the update
+/// runs per token column; vocab at model scale is small (char-level).
+const EMB_BWD_WGSL: &str = r#"
+struct EmbDims {
+    n: u32,     // n = vocab*dim (table length)
+    rows: u32,
+    dim: u32,
+    pad0: u32,
+}
+
+@group(0) @binding(0) var<storage, read> dx_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> ids_buf: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dt_buf: array<f32>;
+@group(0) @binding(3) var<uniform> dims: EmbDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= dims.n) {
+        return;
+    }
+    let dim = dims.dim;
+    let id = i / dim;
+    let j = i - id * dim;
+    // in-place `+=` per row in r-order — same association as the CPU
+    // scatter-add (including the preexisting table value), bit-for-bit.
+    for (var r = 0u; r < dims.rows; r = r + 1u) {
+        if (ids_buf[r] == id) {
+            dt_buf[i] = dt_buf[i] + dx_buf[r * dim + j];
+        }
+    }
+}
+"#;
+
 /// Elementwise + reduction GPU ops (LayerNorm fwd/bwd, GeLU fwd/bwd).
 /// Mirrors the CPU contracts in `ops.rs` element for element.
 pub struct GpuOps {
@@ -945,6 +1016,8 @@ pub struct GpuOps {
     grad_scale: wgpu::ComputePipeline,
     ce_fwd: wgpu::ComputePipeline,
     ce_bwd: wgpu::ComputePipeline,
+    emb_fwd: wgpu::ComputePipeline,
+    emb_bwd: wgpu::ComputePipeline,
 }
 
 impl GpuOps {
@@ -960,6 +1033,8 @@ impl GpuOps {
         let grad_scale = pipeline(&device, "grad-scale", GRAD_SCALE_WGSL);
         let ce_fwd = pipeline(&device, "ce-fwd", CE_FWD_WGSL);
         let ce_bwd = pipeline(&device, "ce-bwd", CE_BWD_WGSL);
+        let emb_fwd = pipeline(&device, "emb-fwd", EMB_FWD_WGSL);
+        let emb_bwd = pipeline(&device, "emb-bwd", EMB_BWD_WGSL);
         Ok(Self {
             device,
             queue,
@@ -973,6 +1048,8 @@ impl GpuOps {
             grad_scale,
             ce_fwd,
             ce_bwd,
+            emb_fwd,
+            emb_bwd,
         })
     }
 
@@ -1274,6 +1351,74 @@ impl GpuOps {
             (per_row.iter().map(|&l| l as f64).sum::<f64>() / rows as f64) as f32;
         let dlogits = readback_f32(&self.device, &self.queue, &d_buf, rows * vocab);
         (loss, dlogits, probs)
+    }
+
+    /// Embedding gather (`modules::Embedding::forward`): row-per-token.
+    pub fn embedding_fwd(&self, table: &[f32], ids: &[usize], dim: usize) -> Vec<f32> {
+        let rows = ids.len();
+        assert!(table.len() % dim == 0, "table shape");
+        for &t in ids {
+            assert!(t * dim < table.len(), "id out of vocab");
+        }
+        if rows == 0 {
+            return Vec::new();
+        }
+        let ids_u32: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
+        let dims = [(rows * dim) as u32, dim as u32, 0u32, 0u32];
+        let table_buf = upload_f32(&self.device, &self.queue, table);
+        let ids_buf = upload_u32_storage(&self.device, &self.queue, &ids_u32);
+        let out_buf = storage_out(&self.device, rows * dim);
+        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.emb_fwd,
+            [ceil_div(rows * dim, 256) as u32, 1],
+            &[
+                bind(0, &table_buf),
+                bind(1, &ids_buf),
+                bind(2, &out_buf),
+                bind(3, &dims_buf),
+            ],
+        );
+        readback_f32(&self.device, &self.queue, &out_buf, rows * dim)
+    }
+
+    /// Embedding scatter-add backward (`Embedding::backward`): accumulates
+    /// the masked row-sums into the existing `grads` table (duplex buffer,
+    /// `+=` semantics like the CPU).
+    pub fn embedding_bwd(&self, ids: &[usize], dx: &[f32], grads: &mut [f32], dim: usize) {
+        let rows = ids.len();
+        assert_eq!(dx.len(), rows * dim, "dx shape");
+        assert!(grads.len() % dim == 0, "grads shape");
+        let vocab = grads.len() / dim;
+        for &t in ids {
+            assert!(t < vocab, "id out of vocab");
+        }
+        if rows == 0 || vocab == 0 || dim == 0 {
+            return;
+        }
+        let ids_u32: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
+        let dims = [(vocab * dim) as u32, rows as u32, dim as u32, 0u32];
+        let dx_buf = upload_f32(&self.device, &self.queue, dx);
+        let ids_buf = upload_u32_storage(&self.device, &self.queue, &ids_u32);
+        let dt_buf = buffer_f32_duplex(&self.device, vocab * dim);
+        self.queue.write_buffer(&dt_buf, 0, bytemuck_bytes(grads));
+        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.emb_bwd,
+            [ceil_div(vocab * dim, 256) as u32, 1],
+            &[
+                bind(0, &dx_buf),
+                bind(1, &ids_buf),
+                bind(2, &dt_buf),
+                bind(3, &dims_buf),
+            ],
+        );
+        let dt_out = readback_f32(&self.device, &self.queue, &dt_buf, vocab * dim);
+        grads.copy_from_slice(&dt_out);
     }
 }
 

@@ -1205,3 +1205,110 @@ fn gpu_attention_perf() {
     println!("{:<22}{:>9.2}{:>9.2}{:>10.2}", "attn.bwd (full)", cpu_b, gpu_b, cpu_b / gpu_b);
     // Note: CPU backward mutates its grads across iters; timing unaffected.
 }
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_embedding_parity"]
+fn gpu_embedding_parity() {
+    use crate::gpu::GpuOps;
+    use crate::modules::Embedding;
+    let ops = GpuOps::new().expect("GpuOps device open");
+    let mut rng = Rng::new(0xE710_CAFE);
+    fn rv(rng: &mut Rng, n: usize) -> Vec<f32> {
+        (0..n).map(|_| rng.normal(0.0, 1.0)).collect()
+    }
+    let tol = 1e-6; // gathers and ordered sums should be near-exact
+
+    // (rows, vocab, dim): default-ish (1024,155,128), ragged, single row,
+    // and a wide-vocab case. Ids are drawn from a narrow range to force
+    // duplicate tokens (scatter-add accumulation).
+    for &(rows, vocab, dim) in
+        [(1024usize, 155usize, 128usize), (17, 33, 7), (1, 128, 64), (256, 1000, 32)]
+            .iter()
+    {
+        let ids: Vec<usize> =
+            (0..rows).map(|_| rng.rand_index(vocab.min(7))).collect(); // heavy dup hits
+        let table = rv(&mut rng, vocab * dim);
+        let dx = rv(&mut rng, rows * dim);
+
+        // forward (CPU reference is the plain gather)
+        let out_gpu = ops.embedding_fwd(&table, &ids, dim);
+        let out_cpu_ref = {
+            let mut o = vec![0.0f32; rows * dim];
+            for (r, &id) in ids.iter().enumerate() {
+                o[r * dim..(r + 1) * dim].copy_from_slice(&table[id * dim..(id + 1) * dim]);
+            }
+            o
+        };
+        let e = rel_err_max(&out_cpu_ref, &out_gpu);
+        println!("emb fwd rows={rows} vocab={vocab} dim={dim}: max rel err {e:.3e}");
+        assert!(e < tol);
+
+        // backward: scatter-add into a NONZERO prefilled grads table
+        // (accumulation semantics), CPU reference via Embedding::backward.
+        let grads_cpu = vec![0.5f32; vocab * dim];
+        let mut grads_gpu = grads_cpu.clone();
+        let mut emb = Embedding::new(vocab, dim, 1.0, &mut rng);
+        emb.w.grads.copy_from_slice(&grads_cpu);
+        emb.backward(&ids, &dx, dim);
+        ops.embedding_bwd(&ids, &dx, &mut grads_gpu, dim);
+        let e = rel_err_max(&emb.w.grads, &grads_gpu);
+        println!("  emb bwd vocab={vocab}: max rel err {e:.3e}");
+        assert!(e < tol);
+    }
+    println!("gpu_embedding_parity: all shapes within tol");
+}
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_embedding_perf"]
+fn gpu_embedding_perf() {
+    use crate::gpu::GpuOps;
+    use crate::modules::Embedding;
+    use std::hint::black_box;
+    use std::time::Instant;
+    let ops = GpuOps::new().expect("GpuOps device open");
+    let mut rng = Rng::new(0xBAD_5EED);
+
+    // Whole-model embedding work per step: tok_emb gather + scatter-add
+    // at default c4 char-vocab size (CPU is bandwidth-bound, sub-ms).
+    let (rows, vocab, dim) = (1024usize, 155usize, 128usize);
+    let ids: Vec<usize> = (0..rows).map(|_| rng.rand_index(vocab)).collect();
+    let dx: Vec<f32> = (0..rows * dim).map(|_| rng.normal(0.0, 1.0)).collect();
+    let table: Vec<f32> = (0..vocab * dim).map(|_| rng.normal(0.0, 0.02)).collect();
+    let (iters, warm) = (10usize, 3usize);
+
+    let mut emb = Embedding::new(vocab, dim, 0.02, &mut rng);
+    let mut g_cpu = vec![0.0f32; vocab * dim];
+    let mut g_gpu = g_cpu.clone();
+    let bench = |cpu: &mut dyn FnMut(), gpu: &mut dyn FnMut()| {
+        for _ in 0..warm {
+            cpu();
+            gpu();
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            cpu();
+        }
+        let cms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        let t = Instant::now();
+        for _ in 0..iters {
+            gpu();
+        }
+        let gms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        (cms, gms)
+    };
+    let (c_ms, g_ms) = bench(
+        &mut || {
+            black_box(emb.forward(&ids, dim));
+            emb.w.grads.copy_from_slice(&g_cpu);
+            emb.backward(&ids, &dx, dim);
+            black_box(&emb.w.grads);
+        },
+        &mut || {
+            black_box(ops.embedding_fwd(&table, &ids, dim));
+            ops.embedding_bwd(&ids, &dx, &mut g_gpu, dim);
+            black_box(&g_gpu);
+        },
+    );
+    println!("{:<30}{:>9}{:>9}{:>10}", "(1024x155x128)", "cpu ms", "gpu ms", "ratio");
+    println!("{:<30}{:>9.2}{:>9.2}{:>10.2}", "emb fwd+bwd", c_ms, g_ms, c_ms / g_ms);
+}

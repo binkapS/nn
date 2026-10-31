@@ -290,7 +290,7 @@ grads table, heavy duplicate-token id streams):
   with `ids[r]==id` **in place, in r-order** — the same association as the
   CPU's row-ordered `+=`. My first version summed the tokens first and then
   added the old table value: different rounding association, and the parity
-  test caught a 2.5e-6 drift (sum of several hundred dups, 1–2 ulp).]);
+  test caught a 2.5e-6 drift (sum of several hundred dups, 1–2 ulp). * (see bit-exactness note below).
 
 Bit-exactness beats cleverness: one extra read-modify-write per hit and
 the two engines agree to the last bit, which makes any later fused

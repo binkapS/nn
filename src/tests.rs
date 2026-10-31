@@ -747,3 +747,132 @@ fn gpu_gemm_perf() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_elementwise_parity"]
+fn gpu_elementwise_parity() {
+    use crate::gpu::GpuOps;
+    fn r2(rng: &mut Rng, n: usize) -> Vec<f32> {
+        (0..n).map(|_| rng.normal(0.0, 1.0)).collect()
+    }
+    let ops = GpuOps::new().expect("GpuOps device open");
+    let mut rng = Rng::new(0xFEED_BEEF);
+    let tol = 2e-3;
+
+    // LayerNorm: default config (1024×128), ragged (17×33 beyond the 256-
+    // thread workgroup width, 5×7), single row, wide row (1024 cols forces
+    // the multi-column stride loop per lane).
+    for &(rows, c) in [(1024usize, 128usize), (17, 33), (5, 7), (1, 128), (3, 1024)].iter() {
+        let x = r2(&mut rng, rows * c);
+        let g = r2(&mut rng, c);
+        let b = r2(&mut rng, c);
+        let eps = 1e-5;
+
+        let cpu = layernorm_fwd(&x, &g, &b, rows, c, eps);
+        let gpu = ops.layernorm_fwd(&x, &g, &b, rows, c, eps);
+        let e = rel_err_max(&cpu, &gpu);
+        println!("ln_fwd {rows}×{c}: max rel err {e:.3e}");
+        assert!(e < tol, "ln_fwd {rows}×{c}");
+
+        let gy = r2(&mut rng, rows * c);
+        let (dx_c, dg_c, db_c) = layernorm_bwd(&x, &gy, &g, rows, c, eps);
+        let (dx_g, dg_g, db_g) = ops.layernorm_bwd(&x, &gy, &g, rows, c, eps);
+        let e = rel_err_max(&dx_c, &dx_g);
+        println!("  ln_bwd dx {rows}×{c}: max rel err {e:.3e}");
+        assert!(e < tol, "ln dx {rows}×{c}");
+        let e = rel_err_max(&dg_c, &dg_g);
+        println!("  ln_bwd dg {rows}×{c}: max rel err {e:.3e}");
+        assert!(e < tol, "ln dg {rows}×{c}");
+        let e = rel_err_max(&db_c, &db_g);
+        println!("  ln_bwd db {rows}×{c}: max rel err {e:.3e}");
+        assert!(e < tol, "ln db {rows}×{c}");
+    }
+
+    // GeLU: values spanning the negative saturation regime and large
+    // magnitudes where the tanh approximation is flat.
+    for &n in [1024usize, 1000usize, 1usize].iter() {
+        let x: Vec<f32> = (0..n)
+            .map(|i| match i % 4 {
+                0 => rng.normal(0.0, 3.0),
+                1 => -(rng.normal(0.0, 10.0).abs() as f32),
+                2 => rng.normal(0.0, 1.0),
+                _ => rng.normal(0.0, 5.0),
+            })
+            .collect();
+        let dy = r2(&mut rng, n);
+
+        let (cpu, _saved) = gelu_fwd(&x);
+        let gpu = ops.gelu_fwd(&x);
+        let e = rel_err_max(&cpu, &gpu);
+        println!("gelu_fwd n={n}: max rel err {e:.3e}");
+        assert!(e < tol, "gelu_fwd n={n}");
+
+        let cpu = gelu_bwd(&x, &dy);
+        let gpu = ops.gelu_bwd(&x, &dy);
+        let e = rel_err_max(&cpu, &gpu);
+        println!("  gelu_bwd n={n}: max rel err {e:.3e}");
+        assert!(e < tol, "gelu_bwd n={n}");
+    }
+    println!("gpu_elementwise_parity: all shapes within tol");
+}
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_elementwise_perf"]
+fn gpu_elementwise_perf() {
+    use crate::gpu::GpuOps;
+    use std::hint::black_box;
+    use std::time::Instant;
+    let ops = GpuOps::new().expect("GpuOps device open");
+    let mut rng = Rng::new(0xBAD_5EED);
+    let mut r2 = |n: usize| (0..n).map(|_| rng.normal(0.0, 1.0)).collect::<Vec<f32>>();
+
+    // Default-config elementwise workloads: between every transformer block
+    // there are two LN fwd + two LN bwd + one gelu pair, at rows=1024, c=128.
+    let (rows, c) = (1024usize, 128usize);
+    let x = r2(rows * c);
+    let g = r2(c);
+    let b = r2(c);
+    let gy = r2(rows * c);
+    let (iters, warm) = (10usize, 3usize);
+
+    let bench = |name: &str, cpu: &dyn Fn(), gpu: &dyn Fn()| {
+        for _ in 0..warm {
+            cpu();
+            gpu();
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            cpu();
+        }
+        let cms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        let t = Instant::now();
+        for _ in 0..iters {
+            gpu();
+        }
+        let gms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!("{:<28}{:>10.3}{:>10.3}{:>10.1}", name, cms, gms, cms / gms);
+    };
+
+    println!("{:<28}{:>10}{:>10}{:>10}", "op (1024×128)", "cpu ms", "gpu ms", "speedup");
+    bench("layernorm.fwd", &|| {
+        black_box(layernorm_fwd(&x, &g, &b, rows, c, 1e-5));
+    }, &|| {
+        black_box(ops.layernorm_fwd(&x, &g, &b, rows, c, 1e-5));
+    });
+    bench("layernorm.bwd", &|| {
+        black_box(layernorm_bwd(&x, &gy, &g, rows, c, 1e-5));
+    }, &|| {
+        black_box(ops.layernorm_bwd(&x, &gy, &g, rows, c, 1e-5));
+    });
+    bench(
+        "gelu.fwd+bwd",
+        &|| {
+            let (y, _s) = gelu_fwd(&x);
+            black_box(gelu_bwd(&x, &y));
+        },
+        &|| {
+            let y = ops.gelu_fwd(&x);
+            black_box(ops.gelu_bwd(&x, &y));
+        },
+    );
+}

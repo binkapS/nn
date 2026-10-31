@@ -420,10 +420,10 @@ impl GpuGemm {
         let x_buf = upload_f32(&self.device, &self.queue, x);
         let wt_buf = upload_f32(&self.device, &self.queue, wt);
         let bias_buf = upload_f32(&self.device, &self.queue, &bias_data);
-        let y_buf = self.storage_out(m * n);
+        let y_buf = storage_out(&self.device, m * n);
         let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
 
-        Self::dispatch(
+        dispatch(
             &self.device,
             &self.queue,
             &self.fwd_pipeline,
@@ -470,10 +470,10 @@ impl GpuGemm {
         let dims = [m as u32, k as u32, n as u32, 0u32];
         let x_buf = upload_f32(&self.device, &self.queue, x);
         let gy_buf = upload_f32(&self.device, &self.queue, gy);
-        let dwt_buf = self.storage_out(k * n);
+        let dwt_buf = storage_out(&self.device, k * n);
         let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
 
-        Self::dispatch(
+        dispatch(
             &self.device,
             &self.queue,
             &self.dwt_pipeline,
@@ -488,44 +488,432 @@ impl GpuGemm {
         let dwt = readback_f32(&self.device, &self.queue, &dwt_buf, k * n);
         (dx, dwt)
     }
+}
 
-    fn storage_out(&self, len_f32: usize) -> wgpu::Buffer {
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gemm-out"),
-            size: (len_f32 * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+// ---------------------------------------------------------------------------
+// Stage 2.2: LayerNorm + GeLU kernels (elementwise, written fusable)
+// ---------------------------------------------------------------------------
+
+/// Forward LayerNorm, one row per workgroup (256 threads):
+/// `y = (x - mean) * rstd * g + b` with population variance, matching the
+/// CPU reference exactly. Pass 1 stages each lane's partial Σx/Σx² in
+/// workgroup memory and tree-reduces; pass 2 re-reads the row and
+/// normalizes. The `var = max(Σx²/n − mean², 0)` clamp guards against a
+/// negative variance from f32 cancellation (the CPU form Σ(x−m)² can't go
+/// negative; mathematically identical).
+const LN_FWD_WGSL: &str = r#"
+struct LnDims {
+    rows: u32,
+    cols: u32,   // c
+    eps: f32,
+    pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> x_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> g_buf: array<f32>;
+@group(0) @binding(2) var<storage, read> b_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y_buf: array<f32>;
+@group(0) @binding(4) var<uniform> dims: LnDims;
+
+const WG: u32 = 256u;
+var<workgroup> red0: array<f32, 256>;
+var<workgroup> red1: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    let c = dims.cols;
+    let lane = lid.x;
+    let base = row * c;
+
+    var s = 0.0;
+    var sq = 0.0;
+    for (var cc = lane; cc < c; cc = cc + WG) {
+        let v = x_buf[base + cc];
+        s = s + v;
+        sq = sq + v * v;
+    }
+    red0[lane] = s;
+    red1[lane] = sq;
+    workgroupBarrier();
+
+    for (var stride = WG / 2u; stride > 0u; stride = stride / 2u) {
+        if (lane < stride) {
+            red0[lane] = red0[lane] + red0[lane + stride];
+            red1[lane] = red1[lane] + red1[lane + stride];
+        }
+        workgroupBarrier();
+    }
+    let mean = red0[0] / f32(c);
+    let var_raw = red1[0] / f32(c) - mean * mean;
+    let variance = select(var_raw, 0.0, var_raw < 0.0);
+    let rstd = 1.0 / sqrt(variance + dims.eps);
+    workgroupBarrier();
+
+    for (var cc = lane; cc < c; cc = cc + WG) {
+        y_buf[base + cc] = (x_buf[base + cc] - mean) * rstd * g_buf[cc] + b_buf[cc];
+    }
+}
+"#;
+
+/// Backward LayerNorm, one row per workgroup. Recomputes the row stats
+/// (forward math), folds `m1 = Σ gy·g` and `m2 = Σ gy·g·x̂` into per-row
+/// scalars via the shared tree, writes the whole `dx` row, and leaves
+/// per-row `dg`/`db` contributions in a (rows × c) partial buffer that a
+/// follow-up column-reduce kernel sums (f32 atomics are not in WebGPU).
+const LN_BWD_WGSL: &str = r#"
+struct LnDims {
+    rows: u32,
+    cols: u32,   // c
+    eps: f32,
+    pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> x_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> gy_buf: array<f32>;
+@group(0) @binding(2) var<storage, read> g_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> dx_buf: array<f32>;
+@group(0) @binding(4) var<storage, read_write> dgp_buf: array<f32>;
+@group(0) @binding(5) var<storage, read_write> dbp_buf: array<f32>;
+@group(0) @binding(6) var<uniform> dims: LnDims;
+
+const WG: u32 = 256u;
+var<workgroup> red0: array<f32, 256>;
+var<workgroup> red1: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    let c = dims.cols;
+    let lane = lid.x;
+    let base = row * c;
+
+    var s = 0.0;
+    var sq = 0.0;
+    for (var cc = lane; cc < c; cc = cc + WG) {
+        let v = x_buf[base + cc];
+        s = s + v;
+        sq = sq + v * v;
+    }
+    red0[lane] = s;
+    red1[lane] = sq;
+    workgroupBarrier();
+    for (var stride = WG / 2u; stride > 0u; stride = stride / 2u) {
+        if (lane < stride) {
+            red0[lane] = red0[lane] + red0[lane + stride];
+            red1[lane] = red1[lane] + red1[lane + stride];
+        }
+        workgroupBarrier();
+    }
+    let mean = red0[0] / f32(c);
+    let var_raw = red1[0] / f32(c) - mean * mean;
+    let variance = select(var_raw, 0.0, var_raw < 0.0);
+    let rstd = 1.0 / sqrt(variance + dims.eps);
+    workgroupBarrier();
+
+    // m1 = Σ gy·g, m2 = Σ gy·g·x̂ ; per-row dg/db partials per column.
+    var m1 = 0.0;
+    var m2 = 0.0;
+    for (var cc = lane; cc < c; cc = cc + WG) {
+        let gv = gy_buf[base + cc];
+        let xhat = (x_buf[base + cc] - mean) * rstd;
+        let gyg = gv * g_buf[cc];
+        m1 = m1 + gyg;
+        m2 = m2 + gyg * xhat;
+        dgp_buf[base + cc] = gv * xhat;
+        dbp_buf[base + cc] = gv;
+    }
+    red0[lane] = m1;
+    red1[lane] = m2;
+    workgroupBarrier();
+    for (var stride = WG / 2u; stride > 0u; stride = stride / 2u) {
+        if (lane < stride) {
+            red0[lane] = red0[lane] + red0[lane + stride];
+            red1[lane] = red1[lane] + red1[lane + stride];
+        }
+        workgroupBarrier();
+    }
+    let m1t = red0[0];
+    let m2t = red1[0];
+    workgroupBarrier();
+
+    // dx = rstd·gy·g − (rstd/c)·(m1 + x̂·m2)
+    for (var cc = lane; cc < c; cc = cc + WG) {
+        let xhat = (x_buf[base + cc] - mean) * rstd;
+        dx_buf[base + cc] = rstd * gy_buf[base + cc] * g_buf[cc]
+            - rstd / f32(c) * (m1t + xhat * m2t);
+    }
+}
+"#;
+
+/// Column reduction over a (w × c) partial buffer: `out[col] = Σ_r p[r·c + col]`.
+/// One thread per column, no barriers needed; used to finish LN dg/db.
+const REDUCE_COLS_WGSL: &str = r#"
+struct RdDims {
+    w: u32,    // rows of partials (= rows of LN input)
+    c: u32,
+    pad0: u32,
+    pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> p_buf: array<f32>;
+@group(0) @binding(1) var<storage, read_write> o_buf: array<f32>;
+@group(0) @binding(2) var<uniform> dims: RdDims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let col = gid.x;
+    let c = dims.c;
+    if (col >= c) {
+        return;
+    }
+    var acc = 0.0;
+    for (var r = 0u; r < dims.w; r = r + 1u) {
+        acc = acc + p_buf[r * c + col];
+    }
+    o_buf[col] = acc;
+}
+"#;
+
+/// GeLU forward (tanh approximation, same constants as `ops::gelu_fwd`):
+/// `y = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
+const GELU_FWD_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read> x_buf: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y_buf: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&x_buf)) {
+        return;
+    }
+    let v = x_buf[i];
+    let u = 0.7978846 * (v + 0.044715 * v * v * v);
+    y_buf[i] = 0.5 * v * (1.0 + tanh(u));
+}
+"#;
+
+/// GeLU backward given the saved forward input x: elementwise.
+const GELU_BWD_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read> x_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> dy_buf: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dx_buf: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&x_buf)) {
+        return;
+    }
+    let v = x_buf[i];
+    let u = 0.7978846 * (v + 0.044715 * v * v * v);
+    let t = tanh(u);
+    let sech2 = 1.0 - t * t;
+    let dudx = 0.7978846 * (1.0 + 3.0 * 0.044715 * v * v);
+    dx_buf[i] = dy_buf[i] * (0.5 * (1.0 + t) + 0.5 * v * sech2 * dudx);
+}
+"#;
+
+/// Elementwise + reduction GPU ops (LayerNorm fwd/bwd, GeLU fwd/bwd).
+/// Mirrors the CPU contracts in `ops.rs` element for element.
+pub struct GpuOps {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    ln_fwd: wgpu::ComputePipeline,
+    ln_bwd: wgpu::ComputePipeline,
+    reduce: wgpu::ComputePipeline,
+    gelu_fwd: wgpu::ComputePipeline,
+    gelu_bwd: wgpu::ComputePipeline,
+}
+
+impl GpuOps {
+    pub fn new() -> Result<Self, String> {
+        let Device { device, queue } = open_device()?;
+        let ln_fwd = pipeline(&device, "ln-fwd", LN_FWD_WGSL);
+        let ln_bwd = pipeline(&device, "ln-bwd", LN_BWD_WGSL);
+        let reduce = pipeline(&device, "reduce-cols", REDUCE_COLS_WGSL);
+        let gelu_fwd = pipeline(&device, "gelu-fwd", GELU_FWD_WGSL);
+        let gelu_bwd = pipeline(&device, "gelu-bwd", GELU_BWD_WGSL);
+        Ok(Self {
+            device,
+            queue,
+            ln_fwd,
+            ln_bwd,
+            reduce,
+            gelu_fwd,
+            gelu_bwd,
         })
     }
 
-    /// One compute pass: bind group + dispatch. Readback is a separate step.
-    fn dispatch(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        pipeline: &wgpu::ComputePipeline,
-        groups: [u32; 2],
-        entries: &[wgpu::BindGroupEntry<'_>],
-    ) {
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gemm-bind"),
-            layout: &layout,
-            entries,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gemm-enc"),
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gemm-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(groups[0], groups[1], 1);
+    /// `ops::layernorm_fwd` on the GPU.
+    pub fn layernorm_fwd(
+        &self,
+        x: &[f32],
+        g: &[f32],
+        b: &[f32],
+        rows: usize,
+        c: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        assert_eq!(x.len(), rows * c, "x shape");
+        assert_eq!(g.len(), c, "g shape");
+        assert_eq!(b.len(), c, "b shape");
+        if rows == 0 {
+            return Vec::new();
         }
-        queue.submit(Some(encoder.finish()));
+        let dims = [rows as u32, c as u32, eps.to_bits(), 0u32];
+        let x_buf = upload_f32(&self.device, &self.queue, x);
+        let g_buf = upload_f32(&self.device, &self.queue, g);
+        let b_buf = upload_f32(&self.device, &self.queue, b);
+        let y_buf = storage_out(&self.device, rows * c);
+        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.ln_fwd,
+            [rows as u32, 1],
+            &[
+                bind(0, &x_buf),
+                bind(1, &g_buf),
+                bind(2, &b_buf),
+                bind(3, &y_buf),
+                bind(4, &dims_buf),
+            ],
+        );
+        readback_f32(&self.device, &self.queue, &y_buf, rows * c)
     }
+
+    /// `ops::layernorm_bwd` on the GPU: `(dx (rows,c), dg (c), db (c))`.
+    pub fn layernorm_bwd(
+        &self,
+        x: &[f32],
+        gy: &[f32],
+        g: &[f32],
+        rows: usize,
+        c: usize,
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        assert_eq!(x.len(), rows * c, "x shape");
+        assert_eq!(gy.len(), rows * c, "gy shape");
+        assert_eq!(g.len(), c, "g shape");
+        if rows == 0 {
+            return (Vec::new(), vec![0.0; c], vec![0.0; c]);
+        }
+        let dims = [rows as u32, c as u32, eps.to_bits(), 0u32];
+        let x_buf = upload_f32(&self.device, &self.queue, x);
+        let gy_buf = upload_f32(&self.device, &self.queue, gy);
+        let g_buf = upload_f32(&self.device, &self.queue, g);
+        let dx_buf = storage_out(&self.device, rows * c);
+        let dgp_buf = storage_out(&self.device, rows * c);
+        let dbp_buf = storage_out(&self.device, rows * c);
+        let dims_buf = upload_uniform_u32(&self.device, &self.queue, &dims);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.ln_bwd,
+            [rows as u32, 1],
+            &[
+                bind(0, &x_buf),
+                bind(1, &gy_buf),
+                bind(2, &g_buf),
+                bind(3, &dx_buf),
+                bind(4, &dgp_buf),
+                bind(5, &dbp_buf),
+                bind(6, &dims_buf),
+            ],
+        );
+
+        // dg/db: column-reduce both partials (rows × c → c).
+        let rd_dims = [rows as u32, c as u32, 0u32, 0u32];
+        let dg_buf = storage_out(&self.device, c);
+        let db_buf = storage_out(&self.device, c);
+        let rd_buf = upload_uniform_u32(&self.device, &self.queue, &rd_dims);
+        for (p, o) in [(&dgp_buf, &dg_buf), (&dbp_buf, &db_buf)] {
+            dispatch(
+                &self.device,
+                &self.queue,
+                &self.reduce,
+                [ceil_div(c, 256) as u32, 1],
+                &[bind(0, p), bind(1, o), bind(2, &rd_buf)],
+            );
+        }
+        let dx = readback_f32(&self.device, &self.queue, &dx_buf, rows * c);
+        let dg = readback_f32(&self.device, &self.queue, &dg_buf, c);
+        let db = readback_f32(&self.device, &self.queue, &db_buf, c);
+        (dx, dg, db)
+    }
+
+    /// `ops::gelu_fwd` tanh approximation; returns `y` (the CPU version's
+    /// returned saved input stays on the host side here).
+    pub fn gelu_fwd(&self, x: &[f32]) -> Vec<f32> {
+        let x_buf = upload_f32(&self.device, &self.queue, x);
+        let y_buf = storage_out(&self.device, x.len());
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.gelu_fwd,
+            [ceil_div(x.len(), 256) as u32, 1],
+            &[bind(0, &x_buf), bind(1, &y_buf)],
+        );
+        readback_f32(&self.device, &self.queue, &y_buf, x.len())
+    }
+
+    /// `ops::gelu_bwd` given the saved forward input.
+    pub fn gelu_bwd(&self, x: &[f32], dy: &[f32]) -> Vec<f32> {
+        assert_eq!(x.len(), dy.len(), "dy shape");
+        let x_buf = upload_f32(&self.device, &self.queue, x);
+        let dy_buf = upload_f32(&self.device, &self.queue, dy);
+        let dx_buf = storage_out(&self.device, x.len());
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.gelu_bwd,
+            [ceil_div(x.len(), 256) as u32, 1],
+            &[bind(0, &x_buf), bind(1, &dy_buf), bind(2, &dx_buf)],
+        );
+        readback_f32(&self.device, &self.queue, &dx_buf, x.len())
+    }
+}
+
+/// Read-only-storage-size output buffer (kernel writes, host copies out).
+fn storage_out(device: &wgpu::Device, len_f32: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gpu-out"),
+        size: (len_f32 * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+/// One compute pass: bind group + dispatch. Readback is a separate step.
+fn dispatch(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &wgpu::ComputePipeline,
+    groups: [u32; 2],
+    entries: &[wgpu::BindGroupEntry<'_>],
+) {
+    let layout = pipeline.get_bind_group_layout(0);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gpu-bind"),
+        layout: &layout,
+        entries,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpu-enc"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(groups[0], groups[1], 1);
+    }
+    queue.submit(Some(encoder.finish()));
 }
 
 fn pipeline(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ComputePipeline {

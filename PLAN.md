@@ -63,7 +63,7 @@ Each item = WGSL kernel(s) + parity test + microbenchmark line here + commit.
 
 * [x] **2.1 Matmul fwd + fused dgrad/wgrad backward** (biggest win; mirrored
       access patterns, transposed tiles).
-* [ ] **2.2 LayerNorm fwd/bwd, GeLU fwd/bwd** (elementwise, cheap).
+* [x] **2.2 LayerNorm fwd/bwd, GeLU fwd/bwd** (elementwise, cheap).
 * [ ] **2.3 AdamW step kernel** (elementwise update, biases/LN scales
       excluded from decay as on CPU).
 * [ ] **2.4 Cross-entropy softmax fwd/bwd.**
@@ -183,3 +183,37 @@ Stage 2.1 lessons:
    chunk index `k` rides the *shared* x/w tile coordinates.
 6. GPU ≈ CPU already on the big GEMM shapes *with* staging overhead —
    the residency pass (2.7) is likely worth more than kernel micro-tuning.
+7. **Elementwise ops on GPU lose to CPU at these sizes (expected)**: at
+   rows=1024×c=128 (~0.25 MB) the un-fused GPU path pays 1–2 buffer-create
+   + upload roundtrips per call: ln.fwd 6.2 ms vs CPU 1.6 ms, ln.bwd 22.5 ms
+   vs 1.9 ms (3 readbacks), gelu pair ~1.0×. This is why 2.2 kernels are
+   single-pass and fused-ready; the payoff arrives when they chain on-DPU
+   (fused blocks in 2.2's design) and with 2.7 residency.
+
+### Stage 2.2 — LayerNorm + GeLU GPU kernels
+
+Parity (vs CPU, max rel err within the 2e-3 gate) — shapes 1024×128,
+17×33, 5×7, 1×128, 3×1024 (stride-loop lanes), GeLU over sign/magnitude
+ranges incl. n=1000 ragged and n=1:
+
+| op        | max rel err |
+|-----------|-------------|
+| ln.fwd    | 8.3e-7      |
+| ln.bwd dx | 5.4e-7      |
+| ln.bwd dg | 2.8e-5      |
+| ln.bwd db | 4.8e-6      |
+| gelu.fwd  | 2.9e-7      |
+| gelu.bwd  | 3.3e-6      |
+
+Kernel notes:
+* `ln_fwd`/`ln_bwd`: one row per 256-thread workgroup; per-lane partials in
+  workgroup memory + barrier tree-reduce; population variance clamped at 0
+  (E[x²]−mean² can dip below zero in f32; CPU's Σ(x−m)² form can't).
+* `ln_bwd` emits per-row dg/db partials into a (rows×c) buffer, then a
+  generic `reduce_cols` kernel finishes them (WebGPU has no f32 atomics).
+* Lesson #6 (this round): `global_invocation_id.x` is the GLOBAL thread
+  index (row·WG + lane), not the workgroup index — one-row-per-workgroup
+  kernels must use `@builtin(workgroup_id)`. Symptom: rel err 1.0 with
+  garbage everywhere on rows ≥ 1 (the kernel read the wrong row).
+* Lesson #7: WGSL float literals reject `_` separators mid-mantissa
+  (`0.797_884_6` → parse error); write `0.7978846`.

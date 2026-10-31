@@ -594,3 +594,156 @@ fn gpu_scaffold() {
     }
     println!("gpu roundtrip OK over {} f32 lanes", data.len());
 }
+
+// ---------------------------------------------------------------------------
+// Stage 2.1: GPU GEMM parity + first benchmarks (vs CPU reference)
+// ---------------------------------------------------------------------------
+
+/// Max relative error |a-b| / max(|a|,|b|,1e-8) over two slices.
+fn rel_err_max(a: &[f32], b: &[f32]) -> f64 {
+    assert_eq!(a.len(), b.len(), "shape mismatch in parity compare");
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| ((x - y) as f64 / (x.abs().max(y.abs()) as f64).max(1e-8).max(1.0)))
+        .fold(0.0f64, f64::max)
+}
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_gemm_parity"]
+fn gpu_gemm_parity() {
+    use crate::gpu::GpuGemm;
+    let gemm = GpuGemm::new().expect("GpuGemm device open");
+    let mut rng = Rng::new(0xC0FF_EE01);
+    let mut r2 = |n: usize| (0..n).map(|_| rng.normal(0.0, 1.0)).collect::<Vec<f32>>();
+
+    // Default-config shapes (multiples of 16) plus deliberately ragged ones
+    // (not multiples of 16, tiny, 1×1) to exercise every OOB-guard path in
+    // the WGSL tiles.
+    let cases: &[(usize, usize, usize, u32)] = &[
+        (1024, 128, 384, 1), // qkv, bias
+        (1024, 128, 128, 0), // proj, no bias
+        (1024, 128, 512, 1), // fc1
+        (1024, 512, 128, 1), // fc2
+        (5, 7, 6, 1),
+        (5, 7, 6, 0),
+        (17, 33, 29, 1),
+        (1, 1, 1, 1),
+        (1, 1, 1, 0),
+    ];
+
+    for &(m, k, n, use_bias) in cases {
+        let x = r2(m * k);
+        let wt = r2(k * n);
+        let bias = r2(n);
+        let bias_opt = if use_bias == 1 { Some(&bias[..]) } else { None };
+        let gy = r2(m * n);
+        let tol = 2e-3;
+
+        let cpu = matmul_fwd(&x, &wt, bias_opt, m, k, n);
+        let gpu = gemm.matmul_fwd(&x, &wt, bias_opt, m, k, n);
+        let e = rel_err_max(&cpu, &gpu);
+        println!("fwd {m}×{k}×{n} bias={use_bias}: max rel err {e:.3e}");
+        assert!(e < tol, "fwd {m}×{k}×{n}: rel err {e} >= {tol}");
+
+        let (dx_c, dwt_c) = matmul_bwd(&x, &wt, &gy, m, k, n);
+        let (dx_g, dwt_g) = gemm.matmul_bwd(&x, &wt, &gy, m, k, n);
+        let e = rel_err_max(&dx_c, &dx_g);
+        println!("  bwd dx {m}×{k}×{n}: max rel err {e:.3e}");
+        assert!(e < tol, "dx {m}×{k}×{n}: rel err {e} >= {tol}");
+        let e = rel_err_max(&dwt_c, &dwt_g);
+        println!("  bwd dwt {m}×{k}×{n}: max rel err {e:.3e}");
+        assert!(e < tol, "dwt {m}×{k}×{n}: rel err {e} >= {tol}");
+    }
+    println!("gpu_gemm_parity: all {} shapes within tol", cases.len());
+}
+
+#[test]
+#[ignore = "needs GPU; run: cargo test --release -- --ignored --nocapture gpu_gemm_perf"]
+fn gpu_gemm_perf() {
+    use crate::gpu::GpuGemm;
+    use std::time::Instant;
+    let gemm = GpuGemm::new().expect("GpuGemm device open");
+    let mut rng = Rng::new(0xBAD_5EED);
+    let mut r2 = |n: usize| (0..n).map(|_| rng.normal(0.0, 1.0)).collect::<Vec<f32>>();
+
+    let m = 1024usize;
+    let iters = 10;
+    let warm = 3;
+    println!(
+        "{:<34}{:>10}{:>10}{:>10}{:>10}",
+        "shape", "cpu ms", "cpu GF/s", "gpu ms", "gpu GF/s"
+    );
+
+    for &(k, n, tag) in [
+        (128usize, 384usize, "qkv"),
+        (128, 128, "proj"),
+        (128, 512, "fc1"),
+        (512, 128, "fc2"),
+    ]
+    .iter()
+    {
+        let x = r2(m * k);
+        let wt = r2(k * n);
+        let bias = r2(n);
+        let gy = r2(m * n);
+        let flops = 2.0 * (m * k * n) as f64;
+        let name = format!("fwd [{tag}] {m}×{k}×{n}");
+
+        // CPU
+        for _ in 0..warm {
+            let _ = matmul_fwd(&x, &wt, Some(&bias), m, k, n);
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            let _ = matmul_fwd(&x, &wt, Some(&bias), m, k, n);
+        }
+        let cpu_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // GPU (upload+dispatch+readback, the Stage-2.1 un-fused path)
+        for _ in 0..warm {
+            let _ = gemm.matmul_fwd(&x, &wt, Some(&bias), m, k, n);
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            let _ = gemm.matmul_fwd(&x, &wt, Some(&bias), m, k, n);
+        }
+        let gpu_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        println!(
+            "{:<34}{:>10.2}{:>10.2}{:>10.2}{:>10.2}",
+            name,
+            cpu_ms,
+            flops / (cpu_ms * 1e6),
+            gpu_ms,
+            flops / (gpu_ms * 1e6),
+        );
+
+        // backward pair
+        let name = format!("bwd [{tag}] {m}×{k}×{n}");
+        let bflops = 3.0 * flops / 2.0;
+        for _ in 0..warm {
+            let _ = matmul_bwd(&x, &wt, &gy, m, k, n);
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            let _ = matmul_bwd(&x, &wt, &gy, m, k, n);
+        }
+        let cpu_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        for _ in 0..warm {
+            let _ = gemm.matmul_bwd(&x, &wt, &gy, m, k, n);
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            let _ = gemm.matmul_bwd(&x, &wt, &gy, m, k, n);
+        }
+        let gpu_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!(
+            "{:<34}{:>10.2}{:>10.2}{:>10.2}{:>10.2}",
+            name,
+            cpu_ms,
+            bflops / (cpu_ms * 1e6),
+            gpu_ms,
+            bflops / (gpu_ms * 1e6),
+        );
+    }
+}

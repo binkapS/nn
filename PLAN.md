@@ -50,10 +50,10 @@ a diagnostic fallback only.
 
 ## Stage 1 — wgpu scaffold behind a `Backend` trait
 
-* [ ] **1.1 Add wgpu dep; adapter probe.** Startup lists adapters, selects
+* [x] **1.1 Add wgpu dep; adapter probe.** Startup lists adapters, selects
       `backend auto` (Vulkan/ANV preferred), warns + falls back to CPU on
       failure. Flag implemented and tested (adapter choice printed to stderr).
-* [ ] **1.2 Parity harness.** Test helper comparing a closure-computed CPU op
+* [x] **1.2 Parity harness.** Test helper comparing a closure-computed CPU op
       vs a submitted GPU buffer (shape, rel-err, max-abs-err reporting). Used
       by every Stage 2 item.
 
@@ -61,7 +61,7 @@ a diagnostic fallback only.
 
 Each item = WGSL kernel(s) + parity test + microbenchmark line here + commit.
 
-* [ ] **2.1 Matmul fwd + fused dgrad/wgrad backward** (biggest win; mirrored
+* [x] **2.1 Matmul fwd + fused dgrad/wgrad backward** (biggest win; mirrored
       access patterns, transposed tiles).
 * [ ] **2.2 LayerNorm fwd/bwd, GeLU fwd/bwd** (elementwise, cheap).
 * [ ] **2.3 AdamW step kernel** (elementwise update, biases/LN scales
@@ -150,3 +150,36 @@ Full `train_step` at default shapes (dedicated diag test):
 3. A stale background `nn` process (231% CPU) polluted live timings once;
    check `ps` before trusting deltas on a shared laptop.
 4. 8-row GEMM panels ≈ 4-row panels within run noise; keep 8+4 (harmless).
+
+### Stage 2.1 — GPU GEMM kernels on the HD 520 (un-fused path, per-call staging)
+
+Note the workload-cost caveat: these GPU numbers include upload-dispatch-
+readback per call; with residency (2.7) the transfers disappear, so the raw
+kernel numbers are strictly better than shown. CPU numbers same-day run for
+fairness (machine load makes CPU figures ±25% across runs).
+
+| Op                    | CPU ms | CPU GF/s | GPU ms | GPU GF/s |
+|-----------------------|--------|----------|--------|----------|
+| fwd qkv  1024×128×384 | 11.6   | 8.7      | 11.7   | 8.6      |
+| bwd qkv               | 27.5   | 5.5      | 26.5   | 5.7      |
+| fwd proj 1024×128×128 | 7.8    | 4.3      | 9.6    | 3.5      |
+| bwd proj              | 15.7   | 3.2      | 19.0   | 2.7      |
+| fwd fc1  1024×128×512 | 19.2   | 7.0      | 15.3   | 8.8      |
+| bwd fc1               | 42.3   | 4.8      | 33.4   | 6.0      |
+| fwd fc2  1024×512×128 | 17.6   | 7.6      | 14.6   | 9.2      |
+| bwd fc2               | 41.2   | 4.9      | 32.5   | 6.2      |
+
+Parity (vs CPU, max rel err): fwd ≤ 3.3e-5, dx ≤ 1.6e-5, dwt ≤ 6.2e-5 —
+all under the 2e-3 gate, including ragged 5×7×6 / 17×33×29 / 1×1×1 shapes
+(with and without bias) that exercise every OOB guard lane.
+
+Stage 2.1 lessons:
+5. **WGSL workgroup staging trap**: a two-coordinate shared tile must not be
+   staged via `lid.x` when the accumulation loop's chunk index has no thread
+   dimension to live in — 16 threads with different `gid.y` write different
+   values to the same `tile_x[lid.x]` slot (silent corruption, rel err 2.0).
+   The dwt kernel dropped staging entirely (thread-accumulate from global,
+   L1 absorbs the redundancy); the fwd kernel keeps staging because its
+   chunk index `k` rides the *shared* x/w tile coordinates.
+6. GPU ≈ CPU already on the big GEMM shapes *with* staging overhead —
+   the residency pass (2.7) is likely worth more than kernel micro-tuning.
